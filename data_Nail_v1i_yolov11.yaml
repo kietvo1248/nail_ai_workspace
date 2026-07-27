@@ -1,0 +1,22 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+nc: 1
+names:
+- Nail
+roboflow:
+  workspace: nhi-tz2cg
+  project: nail-bheyh
+  version: 1
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/nhi-tz2cg/nail-bheyh/dataset/1
+kpt_shape:
+- 4
+- 3
+flip_idx:
+- 0
+- 1
+- 2
+- 3
+path: D:\Documents\Learning_Material\SU26\SEP490\Project\test\Tryon-Nail Detector
+  (YOLO)\Nail.v1i.yolov11

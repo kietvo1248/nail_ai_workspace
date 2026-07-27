@@ -1,0 +1,17 @@
+# =============================================================================
+# DATA CONFIGURATION FILE - YOLOv11-Seg Nail Segmentation
+# =============================================================================
+# Đường dẫn tương đối đến thư mục gốc chứa dataset
+path: ../Nail.v1i.yolov11
+
+# Thư mục chứa ảnh huấn luyện (train) và kiểm tra (val)
+train: train/images
+val: valid/images
+test: test/images
+
+# =============================================================================
+# CLASS CONFIGURATION - Dataset có 1 class: Nail
+# =============================================================================
+nc: 1  # Số lượng class
+names:
+  0: Nail   # Class ID 0 = Nail

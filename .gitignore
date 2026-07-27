@@ -1,0 +1,83 @@
+# =============================================================================
+# .GITIGNORE - Loai tru cac file/folders khong can push len git
+# =============================================================================
+# Muc tieu: Repo chi chua source code, scripts, requirements va data config.
+# Cac file model (best.pt, *.onnx, *.tflite), venv, runs se duoc tao lai
+# boi user khi chay setup_env.py + train.py.
+# =============================================================================
+
+# ---------- Python cache & build ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---------- Virtual environment ----------
+venv/
+venv311/
+.venv/
+env/
+ENV/
+.python-version
+pip-wheel-metadata/
+
+# ---------- Trained models & training output (HUGE - 3GB+) ----------
+# Tat ca nhung file nay se duoc tao lai khi chay train.py
+*.pt
+*.onnx
+*.tflite
+*.engine
+*.trt
+*.h5
+*.pb
+*.weights
+*.savedmodel
+
+# Folder chua training output (weights, logs, plots, csv,...)
+runs/
+mobile_model/
+at/
+output/
+inference_output/
+test_output/
+*.npz
+*.npy
+
+# ---------- Editor & OS ----------
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+*.tmp
+*.bak
+*.log
+*.pid
+*.seed
+
+# ---------- Dataset (user tu them dataset vao parent folder) ----------
+# Mac dinh: dataset nam NGOAI workspace (trong parent folder).
+# Neu ban dat dataset TRONG workspace thi uncomment dong duoi:
+# Nail.v1i.yolov11/
+# nail-segmentation.v1i.yolov11_10501/
+
+# ---------- Export artifacts ----------
+*.tflite
+*.lite
+saved_model/
+fingerprint.pb
+variables/
+_onnx2tf_work/
+calibration_image_sample_data_*.npy
+
+# ---------- Pip cache ----------
+pip-cache/
+.cache/

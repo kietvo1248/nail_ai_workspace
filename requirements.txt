@@ -1,0 +1,37 @@
+# =============================================================================
+# REQUIREMENTS.TXT - Dependencies cho YOLOv11 Training & TFLite Export
+# =============================================================================
+# LƯU Ý QUAN TRỌNG: Python 3.14 chưa được TensorFlow hỗ trợ!
+# Nếu gặp lỗi, hãy tạo virtual environment với Python 3.11 hoặc 3.12
+#
+# Hướng dẫn:
+#   python -m venv venv
+#   venv\Scripts\activate
+#   pip install -r requirements.txt
+#
+# Hoặc sử dụng Anaconda:
+#   conda create -n nail_ai python=3.11 -y
+#   conda activate nail_ai
+#   pip install -r requirements.txt
+# =============================================================================
+
+# --- Core dependencies ---
+# Sử dụng phiên bản tương thích với Python 3.11/3.12
+ultralytics>=8.3.0
+torch>=2.0.0
+opencv-python>=4.10.0
+numpy>=1.24.0
+Pillow>=10.0.0
+PyYAML>=6.0.0
+
+# --- TFLite export (Windows-compatible pipeline) ---
+# TensorFlow chỉ hỗ trợ wheels cho Python 3.9-3.12; không tương thích 3.13+.
+# Trên Linux/macOS Ultralytics sẽ dùng 'litert' trực tiếp (TF optional).
+# Trên Windows export_all.py sẽ tự động dùng onnx2tf làm fallback.
+tensorflow>=2.16.0           # Chính (cần cho TFLite)
+tf_keras>=2.16.0            # onnx2tf dependency
+onnx2tf>=1.28.0             # ONNX -> TFLite (Windows fallback)
+onnx-graphsurgeon>=0.6.0     # onnx2tf dependency
+onnx-simplifier>=0.4.30      # onnx2tf dependency
+sng4onnx>=2.0.0             # onnx2tf dependency
+ai-edge-litert>=2.0.0       # TFLite runtime (mobile inference)
