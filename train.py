@@ -593,7 +593,7 @@ def _run_subprocess(script_relpath: str, *extra_args: str) -> int:
     """
     python_exec = get_python_executable()
     script_path = Path(__file__).parent.resolve() / script_relpath
-    cmd = [python_exec, str(script_path), *extra_args]
+    cmd = [str(python_exec), str(script_path), *extra_args]
     print_info(f"Exec: {' '.join(cmd)}")
     result = subprocess.run(cmd, cwd=Path(__file__).parent.resolve())
     return result.returncode
@@ -766,6 +766,64 @@ def _resolve_obb_data_yaml(dataset_path: Path) -> Path:
     return p
 
 
+def _prompt_train_params(default_epochs: int, default_imgsz: int, default_batch: int) -> tuple:
+    """ chọn epochs, imgsz, batch size, và device.
+
+    Returns:
+        (epochs_str, imgsz_str, batch_str, device_str)
+    """
+    print(f"\n{Colors.YELLOW}--- Cấu hình training ---{Colors.END}")
+
+    # --- Epochs ---
+    epochs_input = input(
+        f"  {Colors.CYAN}Số epochs {Colors.END}"
+        f"{Colors.YELLOW}(Enter = {default_epochs}){Colors.END}: "
+    ).strip()
+    try:
+        epochs = int(epochs_input) if epochs_input else default_epochs
+    except ValueError:
+        print_warning(f"Giá trị không hợp lệ, dùng mặc định: {default_epochs}")
+        epochs = default_epochs
+
+    # --- Image size ---
+    print(f"\n  Chọn image size:")
+    imgsz_options = {
+        "1": (320, "320 (nhanh, mobile)"),
+        "2": (416, "416 (cân bằng)"),
+        "3": (640, "640 (chất lượng cao, mặc định)"),
+    }
+    for k, (v, label) in imgsz_options.items():
+        marker = f"{Colors.YELLOW} ← default{Colors.END}" if v == default_imgsz else ""
+        print(f"    {Colors.CYAN}{k}.{Colors.END} {label}{marker}")
+    imgsz_choice = input(f"  {Colors.CYAN}Chọn (1-3, Enter = default): {Colors.END}").strip()
+    imgsz = imgsz_options.get(imgsz_choice, (default_imgsz, ""))[0]
+
+    # --- Batch size ---
+    print(f"\n  Chọn batch size:")
+    batch_options = {
+        "1": (4, "4 (ít VRAM, ~4 GB)"),
+        "2": (8, "8 (RTX 2060 an toàn)"),
+        "3": (16, "16 (mặc định, cần ~8 GB)"),
+        "4": (32, "32 (nhiều VRAM)"),
+    }
+    for k, (v, label) in batch_options.items():
+        marker = f"{Colors.YELLOW} ← default{Colors.END}" if v == default_batch else ""
+        print(f"    {Colors.CYAN}{k}.{Colors.END} {label}{marker}")
+    batch_choice = input(f"  {Colors.CYAN}Chọn (1-4, Enter = default): {Colors.END}").strip()
+    batch = batch_options.get(batch_choice, (default_batch, ""))[0]
+
+    # --- Device ---
+    print(f"\n  Chọn thiết bị training:")
+    device_str = scan_gpus()
+    if device_str != "cpu":
+        print(f"  {Colors.GREEN}GPU sẵn sàng: device={device_str}{Colors.END}")
+    else:
+        print(f"  {Colors.YELLOW}Sẽ train trên CPU (chậm hơn).{Colors.END}")
+
+    print(f"\n{Colors.GREEN}  ✔ epochs={epochs}  imgsz={imgsz}  batch={batch}  device={device_str}{Colors.END}\n")
+    return str(epochs), str(imgsz), str(batch), device_str
+
+
 def _run_obb_smoke() -> None:
     """[2] OBB smoke test (139 ảnh)."""
     print_header("TRAIN OBB - SMOKE TEST (139 ảnh)")
@@ -773,11 +831,16 @@ def _run_obb_smoke() -> None:
     override = input_path("Nhập data.yaml khác (Enter = default)")
     data_yaml = override if override else _SMOKE_DATASET_DATA_YAML
 
+    epochs, imgsz, batch, device = _prompt_train_params(
+        default_epochs=20, default_imgsz=416, default_batch=8
+    )
     rc = _run_subprocess(
         "train_obb.py",
         "--data", data_yaml,
-        "--epochs", "20",
-        "--imgsz", "416",
+        "--epochs", epochs,
+        "--imgsz", imgsz,
+        "--batch", batch,
+        "--device", device,
     )
     if rc != 0:
         print_error(f"train_obb.py exited with code {rc}")
@@ -790,11 +853,16 @@ def _run_obb_production() -> None:
     override = input_path("Nhập data.yaml khác (Enter = default)")
     data_yaml = override if override else _PRODUCTION_DATASET_DATA_YAML
 
+    epochs, imgsz, batch, device = _prompt_train_params(
+        default_epochs=150, default_imgsz=640, default_batch=8
+    )
     rc = _run_subprocess(
         "train_obb.py",
         "--data", data_yaml,
-        "--epochs", "150",
-        "--imgsz", "640",
+        "--epochs", epochs,
+        "--imgsz", imgsz,
+        "--batch", batch,
+        "--device", device,
     )
     if rc != 0:
         print_error(f"train_obb.py exited with code {rc}")
@@ -807,11 +875,16 @@ def _run_obb_5class() -> None:
     override = input_path("Nhập data.yaml khác (Enter = default)")
     data_yaml = override if override else _PRODUCTION_DATASET_DATA_YAML
 
+    epochs, imgsz, batch, device = _prompt_train_params(
+        default_epochs=150, default_imgsz=640, default_batch=8
+    )
     rc = _run_subprocess(
         "train_obb_5class.py",
         "--data", data_yaml,
-        "--epochs", "150",
-        "--imgsz", "640",
+        "--epochs", epochs,
+        "--imgsz", imgsz,
+        "--batch", batch,
+        "--device", device,
     )
     if rc != 0:
         print_error(f"train_obb_5class.py exited with code {rc}")

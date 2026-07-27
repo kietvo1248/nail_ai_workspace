@@ -382,6 +382,11 @@ def main() -> int:
     print("=" * 70)
 
     model = YOLO(args.model)
+
+    import torch
+    if (args.device == "0" or args.device == 0) and not torch.cuda.is_available():
+        print("[WARNING] CUDA khong kha dung. Tu dong chuyen fallback sang CPU.")
+        args.device = "cpu"
     results = model.train(
         data=str(obb_data_yaml),
         epochs=epochs,
