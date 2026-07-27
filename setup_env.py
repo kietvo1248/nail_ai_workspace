@@ -122,7 +122,10 @@ def create_venv(python_exe: str, recreate: bool = False) -> Path:
                 return py
 
     log("INFO", f"Tao venv311 (co the mat 5-10 giay)...")
-    cmd = python_exe.split() if " " in python_exe else [python_exe]
+    if os.path.isfile(python_exe):
+        cmd = [python_exe]
+    else:
+        cmd = python_exe.split()
     subprocess.check_call(cmd + ["-m", "venv", str(VENV_DIR)])
     log("OK", f"Da tao venv311: {VENV_DIR}")
     return venv_python()

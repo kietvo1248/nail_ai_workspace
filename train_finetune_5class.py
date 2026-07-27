@@ -111,6 +111,11 @@ def main() -> int:
     print("Loading base model for fine-tuning...")
     model = YOLO(str(base_model))
 
+    import torch
+    if args.device == "0" and not torch.cuda.is_available():
+        print("[WARNING] CUDA khong kha dung. Tu dong chuyen fallback sang CPU.")
+        args.device = "cpu"
+
     print("Starting fine-tune training...")
     print("  Goal: Fix finger classification (index/middle/pinky/ring/thumb)")
     print("  Key changes: cls=2.0, fliplr=0.0, degrees=30, mosaic=0.8")
