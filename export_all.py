@@ -54,15 +54,13 @@ MOBILE_DIR: Path = WORKSPACE_ROOT / "mobile_model"
 
 
 def list_runs() -> List[Path]:
-    """Return sorted list of run directories containing best.pt."""
+    """Return sorted list of run directories containing best.pt (recursive)."""
     if not RUNS_DIR.exists():
         return []
     runs: List[Path] = []
-    for run_dir in RUNS_DIR.iterdir():
-        if not run_dir.is_dir():
-            continue
-        best_pt = run_dir / "weights" / "best.pt"
-        if best_pt.exists():
+    for best_pt in RUNS_DIR.rglob("weights/best.pt"):
+        run_dir = best_pt.parent.parent  # weights/ -> run root
+        if run_dir not in runs:
             runs.append(run_dir)
     return sorted(runs, key=lambda p: p.stat().st_mtime, reverse=True)
 
