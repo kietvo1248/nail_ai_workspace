@@ -890,6 +890,28 @@ def _run_obb_5class() -> None:
         print_error(f"train_obb_5class.py exited with code {rc}")
 
 
+def _run_seg_5class() -> None:
+    """[7] Seg 5-class (finger classification)."""
+    print_header("TRAIN SEG 5-CLASS")
+    print_info(f"Default data.yaml: {_PRODUCTION_DATASET_DATA_YAML}")
+    override = input_path("Nhập data.yaml khác (Enter = default)")
+    data_yaml = override if override else _PRODUCTION_DATASET_DATA_YAML
+
+    epochs, imgsz, batch, device = _prompt_train_params(
+        default_epochs=150, default_imgsz=640, default_batch=8
+    )
+    rc = _run_subprocess(
+        "train_seg_5class.py",
+        "--data", data_yaml,
+        "--epochs", epochs,
+        "--imgsz", imgsz,
+        "--batch", batch,
+        "--device", device,
+    )
+    if rc != 0:
+        print_error(f"train_seg_5class.py exited with code {rc}")
+
+
 # =============================================================================
 # MAIN EXECUTION
 # =============================================================================
@@ -953,15 +975,16 @@ def main():
         "Train OBB 5-class (finger names)",     # 4
         "Train Pose (legacy, 4 keypoints)",     # 5
         "Resume training (đã có last.pt)",       # 6
+        "Train Seg 5-class (finger names & rotation)", # 7
     ]
     for i, opt in enumerate(menu_options, 1):
         print(f"  {Colors.CYAN}{i}.{Colors.END} {opt}")
 
     choice = input(
-        f"\n{Colors.CYAN}Chọn (1-6, Enter = 1): {Colors.END}"
+        f"\n{Colors.CYAN}Chọn (1-7, Enter = 1): {Colors.END}"
     ).strip() or "1"
 
-    if choice not in {"1", "2", "3", "4", "5", "6"}:
+    if choice not in {"1", "2", "3", "4", "5", "6", "7"}:
         print_warning("Lựa chọn không hợp lệ, mặc định về [1] Seg.")
         choice = "1"
 
@@ -988,6 +1011,9 @@ def main():
         # Re-trigger the resume block if user picks it from the menu.
         print_info("Hãy chạy lại script để kích hoạt resume prompt.")
         print_info("Hoặc đặt last.pt vào runs/<name>/weights/last.pt rồi chạy lại.")
+
+    elif choice == "7":
+        _run_seg_5class()
 
 
 if __name__ == "__main__":
