@@ -5,7 +5,7 @@ TRAIN.PY - Interactive Training Menu for YOLOv11 (Seg / OBB / Pose)
 Script điều phối huấn luyện nhiều loại mô hình YOLOv11 cho nhận diện móng.
 
 **Tính năng:**
-  - Interactive menu: chọn Seg / OBB / Pose / 5-class OBB / Resume
+  - Interactive menu: chọn Seg / OBB / Pose / 5-class / 2-class / Resume
   - Multi-dataset support: Mỗi dataset có thư mục results riêng với timestamp
   - Tự động tạo train/val split nếu chưa có
   - Lưu kết quả có tổ chức: runs/<dataset_name>/<timestamp>/
@@ -18,6 +18,8 @@ Script điều phối huấn luyện nhiều loại mô hình YOLOv11 cho nhận
   [4] Train OBB 5-class         - YOLO11-OBB, classification index/middle/...
   [5] Train Pose (legacy)       - YOLOv11-Pose, 4 keypoints
   [6] Resume training           - tiếp tục last.pt
+  [7] Train Seg 5-class        - YOLOv11-Seg, finger classification
+  [8] Train Seg 2-class       - YOLOv11-Seg, nail_bed + full_nail
 
 **Sử dụng:**
   python train.py
@@ -583,6 +585,7 @@ def get_training_config(dataset_name):
 # Smoke test dataset (139 ảnh) - hard-coded default paths to make the menu
 # flow effortless. Both files live in the parent directory of nail_ai_workspace.
 _SMOKE_DATASET_DATA_YAML = "..\\Nail_Detection_ThanhDT.v1i.yolov11\\data.yaml"
+_SMOKE_DATASET_DATA_YAML_2CLASS = "..\\Nail_Detection_ThanhDT.v1i.yolov11\\data_2class.yaml"
 _PRODUCTION_DATASET_DATA_YAML = "..\\nail-segmentation.v1i.yolov11_10501\\data.yaml"
 
 
@@ -893,16 +896,26 @@ def _run_obb_5class() -> None:
 def _run_seg_5class() -> None:
     """[7] Seg 5-class (finger classification)."""
     print_header("TRAIN SEG 5-CLASS")
-    print_info(f"Default data.yaml: {_PRODUCTION_DATASET_DATA_YAML}")
-    override = input_path("Nhập data.yaml khác (Enter = default)")
-    data_yaml = override if override else _PRODUCTION_DATASET_DATA_YAML
+    
+    # Cho phép người dùng chọn thư mục dataset
+    dataset_path = _pick_dataset_path()
+    data_yaml = dataset_path / "data.yaml"
+    if not data_yaml.exists():
+        print_warning(f"Không tìm thấy data.yaml mặc định ở {data_yaml}")
+        override = input_path("Nhập đường dẫn trực tiếp đến file data.yaml")
+        if override:
+            data_yaml = Path(override)
+        else:
+            return
+            
+    print_info(f"Sử dụng dataset: {data_yaml}")
 
     epochs, imgsz, batch, device = _prompt_train_params(
         default_epochs=150, default_imgsz=640, default_batch=8
     )
     rc = _run_subprocess(
         "train_seg_5class.py",
-        "--data", data_yaml,
+        "--data", str(data_yaml),
         "--epochs", epochs,
         "--imgsz", imgsz,
         "--batch", batch,
@@ -910,6 +923,143 @@ def _run_seg_5class() -> None:
     )
     if rc != 0:
         print_error(f"train_seg_5class.py exited with code {rc}")
+
+
+def _run_seg_2class() -> None:
+    """[8] Seg 2-class (nail_bed + full_nail).
+
+    Workflow:
+      1. Ask for dataset folder path
+      2. Ask for nail_bed_ratio
+      3. Run convert_polygon_to_nailbed.py to generate labels_2class/
+      4. Check / create data_2class.yaml
+      5. Run train_seg_2class.py
+      6. Offer to run export_all.py --seg-2class
+    """
+    print_header("TRAIN SEG 2-CLASS (nail_bed + full_nail)")
+
+    # --- Step 1: Pick dataset folder ---
+    dataset_path = _pick_dataset_path()
+    dataset_root = Path(dataset_path).resolve()
+
+    # Validate that it looks like a YOLO dataset
+    train_images = dataset_root / "train" / "images"
+    train_labels = dataset_root / "train" / "labels"
+    if not train_images.exists() or not train_labels.exists():
+        print_error("Thư mục không chứa train/images và train/labels!")
+        return
+
+    # Count images
+    exts = ["*.jpg", "*.jpeg", "*.png", "*.bmp"]
+    img_count = sum(len(list(train_images.glob(e))) for e in exts)
+    print_success(f"Dataset: {dataset_root}  ({img_count} ảnh)")
+
+    labels_src = train_labels
+    labels_dst = dataset_root / "train" / "labels_2class"
+    labels_valid_src = dataset_root / "valid" / "labels"
+    labels_valid_dst = dataset_root / "valid" / "labels_2class"
+
+    # --- Step 2: Ask nail_bed_ratio ---
+    print_info("Bước 2: Cấu hình nail bed ratio")
+    ratio_input = input(
+        f"  {Colors.CYAN}Nail bed ratio (0.50-0.95, Enter = 0.75): {Colors.END}"
+    ).strip()
+    try:
+        bed_ratio = float(ratio_input) if ratio_input else 0.75
+    except ValueError:
+        print_warning("Giá trị không hợp lệ, dùng 0.75")
+        bed_ratio = 0.75
+
+    if not (0.50 <= bed_ratio <= 0.95):
+        print_warning("Giá trị ngoài range [0.50, 0.95], dùng 0.75")
+        bed_ratio = 0.75
+
+    print_success(f"Nail bed ratio: {bed_ratio:.2f}")
+
+    # --- Step 3: Convert labels ---
+    print_info("Bước 3: Convert 5-class labels → 2-class labels")
+
+    if labels_dst.exists() and any(labels_dst.glob("*.txt")):
+        print_success(f"labels_2class/ đã tồn tại ({len(list(labels_dst.glob('*.txt')))} files)")
+        convert_choice = input(
+            f"{Colors.YELLOW}Tái tạo labels_2class? (y = có, Enter = bỏ qua): {Colors.END}"
+        ).strip().lower()
+    else:
+        convert_choice = "y"
+
+    if convert_choice == "y":
+        print_info(f"Chạy convert với bed_ratio={bed_ratio:.2f}")
+        convert_args = [
+            "--labels", str(labels_src),
+            "--output", str(labels_dst),
+            "--bed-ratio", str(bed_ratio),
+            "--valid", str(labels_valid_src),
+            "--valid-output", str(labels_valid_dst),
+        ]
+        rc = _run_subprocess("convert_polygon_to_nailbed.py", *convert_args)
+        if rc != 0:
+            print_error("convert_polygon_to_nailbed.py failed!")
+            print_info("Kiểm tra thư mục labels gốc:")
+            print(f"  {labels_src}")
+            return
+    else:
+        print_info("Bỏ qua convert, dùng labels_2class/ có sẵn.")
+
+    # --- Step 4: data_2class.yaml ---
+    print_info("Bước 4: Chuẩn bị data_2class.yaml")
+    data_2class_yaml = dataset_root / "data_2class.yaml"
+    if not data_2class_yaml.exists():
+        yaml_content = f"""# =============================================================================
+# DATA_2CLASS.YAML - Dataset for YOLO-Seg 2-class (nail_bed + full_nail)
+# Auto-generated by train.py
+# =============================================================================
+
+train: train/images
+val: valid/images
+
+nc: 2
+names:
+  - nail_bed    # class 0: portion near cuticle (where design is applied)
+  - full_nail   # class 1: entire nail plate
+
+path: "{dataset_root.as_posix()}"
+"""
+        with open(data_2class_yaml, "w", encoding="utf-8") as f:
+            f.write(yaml_content)
+        print_success(f"Đã tạo: {data_2class_yaml}")
+    else:
+        print_success(f"data_2class.yaml: {data_2class_yaml}")
+
+    # --- Step 5: Train ---
+    print_info("Bước 5: Training")
+    epochs, imgsz, batch, device = _prompt_train_params(
+        default_epochs=300, default_imgsz=640, default_batch=8
+    )
+    rc = _run_subprocess(
+        "train_seg_2class.py",
+        "--data", str(data_2class_yaml),
+        "--epochs", epochs,
+        "--imgsz", imgsz,
+        "--batch", batch,
+        "--device", device,
+    )
+    if rc != 0:
+        print_error(f"train_seg_2class.py exited with code {rc}")
+        return
+
+    # --- Step 6: Offer to export ---
+    print_info("Bước 6: Export ONNX")
+    export_choice = input(
+        f"{Colors.YELLOW}Chạy export_all.py --seg-2class ngay? (y/n, Enter = y): {Colors.END}"
+    ).strip().lower() or "y"
+    if export_choice in ["y", "yes"]:
+        export_rc = _run_subprocess(
+            "export_all.py", "--seg-2class"
+        )
+        if export_rc == 0:
+            print_success("Export hoàn tất!")
+        else:
+            print_error(f"export_all.py exited with code {export_rc}")
 
 
 # =============================================================================
@@ -976,15 +1126,16 @@ def main():
         "Train Pose (legacy, 4 keypoints)",     # 5
         "Resume training (đã có last.pt)",       # 6
         "Train Seg 5-class (finger names & rotation)", # 7
+        "Train Seg 2-class (nail_bed + full_nail)",   # 8
     ]
     for i, opt in enumerate(menu_options, 1):
         print(f"  {Colors.CYAN}{i}.{Colors.END} {opt}")
 
     choice = input(
-        f"\n{Colors.CYAN}Chọn (1-7, Enter = 1): {Colors.END}"
+        f"\n{Colors.CYAN}Chọn (1-8, Enter = 1): {Colors.END}"
     ).strip() or "1"
 
-    if choice not in {"1", "2", "3", "4", "5", "6", "7"}:
+    if choice not in {"1", "2", "3", "4", "5", "6", "7", "8"}:
         print_warning("Lựa chọn không hợp lệ, mặc định về [1] Seg.")
         choice = "1"
 
@@ -1014,6 +1165,9 @@ def main():
 
     elif choice == "7":
         _run_seg_5class()
+
+    elif choice == "8":
+        _run_seg_2class()
 
 
 if __name__ == "__main__":

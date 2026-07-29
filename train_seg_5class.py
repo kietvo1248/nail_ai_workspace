@@ -131,6 +131,7 @@ def main() -> int:
         workers=args.workers,
         plots=True,
         verbose=True,
+        amp=False,             # Disable AMP to prevent CUDA misaligned address error
         # Augmentation parameters identical to OBB for maximum robustness
         degrees=args.degrees,
         translate=0.2,

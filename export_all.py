@@ -35,6 +35,8 @@ Usage:
     python export_all.py --pose --kpt-shape 4 3
     python export_all.py --obb                 # export an OBB model
     python export_all.py --obb --run nail_obb_smoke_20260727
+    python export_all.py --seg-2class         # export a Seg 2-class model (nail_bed + full_nail)
+    python export_all.py --seg-2class --run Nail_Detection_ThanhDT_seg_2class_20260729
 """
 from __future__ import annotations
 
@@ -91,6 +93,7 @@ def export_onnx(
     imgsz: int = 416,
     pose: bool = False,
     obb: bool = False,
+    seg_2class: bool = False,
     kpt_shape: tuple[int, int] = (4, 3),
 ) -> Optional[Path]:
     """Export best.pt to ONNX format. Returns the path to the ONNX file.
@@ -101,6 +104,7 @@ def export_onnx(
         imgsz:      Input image size.
         pose:       If True, exports as a Pose model (with keypoints).
         obb:        If True, exports as an OBB model (oriented bounding boxes).
+        seg_2class: If True, exports as a Seg 2-class model (nail_bed + full_nail).
         kpt_shape:  (num_keypoints, keypoint_dim) for Pose export. Ignored for OBB.
     """
     try:
@@ -135,8 +139,11 @@ def export_onnx(
             exported_path = model.export(
                 format="onnx", imgsz=imgsz, simplify=False, opset=20
             )
+    elif seg_2class:
+        target_name = out_dir / "nail_seg_2class.onnx"
+        exported_path = model.export(format="onnx", imgsz=imgsz, simplify=False, opset=20)
     else:
-        # Seg and OBB share the same export call signature.
+        # Default Seg
         suffix = "_5class" if obb and best_pt.parent.parent.name.endswith("5class") else ""
         target_name = out_dir / ("nail_obb" + suffix + ".onnx" if obb else "nail_seg.onnx")
         exported_path = model.export(format="onnx", imgsz=imgsz, simplify=False, opset=20)
@@ -154,6 +161,7 @@ def export_tflite(
     imgsz: int = 416,
     pose: bool = False,
     obb: bool = False,
+    seg_2class: bool = False,
 ) -> Optional[Path]:
     """Export best.pt to LiteRT/TFLite format.
 
@@ -163,7 +171,7 @@ def export_tflite(
     system = platform.system()
 
     if system == "Windows":
-        return _export_tflite_windows(best_pt, out_dir, imgsz=imgsz, pose=pose, obb=obb)
+        return _export_tflite_windows(best_pt, out_dir, imgsz=imgsz, pose=pose, obb=obb, seg_2class=seg_2class)
 
     # Linux / macOS: use Ultralytics native path.
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -184,6 +192,8 @@ def export_tflite(
             target = out_dir / "nail_obb_float16.tflite"
         elif pose:
             target = out_dir / "nail_pose_float16.tflite"
+        elif seg_2class:
+            target = out_dir / "nail_seg_2class_float16.tflite"
         else:
             target = out_dir / "nail_seg_float16.tflite"
         if exported_path.resolve() != target.resolve():
@@ -202,6 +212,7 @@ def _export_tflite_windows(
     imgsz: int = 416,
     pose: bool = False,
     obb: bool = False,
+    seg_2class: bool = False,
 ) -> Optional[Path]:
     """Windows-only: ONNX -> TFLite via onnx2tf."""
     os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
@@ -216,10 +227,16 @@ def _export_tflite_windows(
 
     if obb:
         task = "OBB"
+        target = out_dir / "nail_obb_float16.tflite"
     elif pose:
         task = "Pose"
+        target = out_dir / "nail_pose_float16.tflite"
+    elif seg_2class:
+        task = "Seg 2-class"
+        target = out_dir / "nail_seg_2class_float16.tflite"
     else:
         task = "Seg"
+        target = out_dir / "nail_seg_float16.tflite"
     print(f"\n[TFLite] Windows pipeline: ONNX (static) -> onnx2tf -> TFLite "
           f"(task={task}, imgsz={imgsz})...")
 
@@ -228,6 +245,8 @@ def _export_tflite_windows(
         static_onnx = out_dir / "nail_obb_static.onnx"
     elif pose:
         static_onnx = out_dir / "nail_pose_static.onnx"
+    elif seg_2class:
+        static_onnx = out_dir / "nail_seg_2class_static.onnx"
     else:
         static_onnx = out_dir / "nail_seg_static.onnx"
     try:
@@ -320,7 +339,7 @@ def _export_tflite_windows(
         return None
 
 
-def copy_to_desktop(onnx_path: Path, pose: bool = False, obb: bool = False) -> Optional[Path]:
+def copy_to_desktop(onnx_path: Path, pose: bool = False, obb: bool = False, seg_2class: bool = False) -> Optional[Path]:
     """Copy the ONNX file to nail_desktop_app/assets/."""
     if not DESKTOP_ASSETS.exists():
         print(f"[Copy] Desktop assets dir not found: {DESKTOP_ASSETS}")
@@ -333,6 +352,8 @@ def copy_to_desktop(onnx_path: Path, pose: bool = False, obb: bool = False) -> O
         label = "OBB"
     elif pose:
         label = "Pose"
+    elif seg_2class:
+        label = "Seg 2-class"
     else:
         label = "Seg"
     print(f"[Copy] Copied {label} ONNX to: {target}")
@@ -355,6 +376,10 @@ def parse_args() -> argparse.Namespace:
                         help="Export a Pose model (expects kpt_shape in data.yaml)")
     parser.add_argument("--obb", action="store_true",
                         help="Export an OBB (oriented bounding box) model")
+    parser.add_argument("--seg", action="store_true",
+                        help="Export a Seg model (default when neither --pose nor --obb is set)")
+    parser.add_argument("--seg-2class", action="store_true",
+                        help="Export a Seg 2-class model (nail_bed + full_nail)")
     parser.add_argument("--kpt-shape", type=int, nargs=2, default=[4, 3],
                         help="Pose keypoint shape: <num_keypoints> <keypoint_dim>")
     return parser.parse_args()
@@ -389,6 +414,8 @@ def main() -> int:
         mode_label = "OBB"
     elif args.pose:
         mode_label = "Pose"
+    elif args.seg_2class:
+        mode_label = "Seg 2-class"
     else:
         mode_label = "Seg"
     print(f"\nSelected run: {run_dir.name}")
@@ -404,6 +431,7 @@ def main() -> int:
         imgsz=args.imgsz,
         pose=args.pose,
         obb=args.obb,
+        seg_2class=args.seg_2class,
         kpt_shape=tuple(args.kpt_shape),
     )
     if onnx_path is None:
@@ -412,7 +440,7 @@ def main() -> int:
     # --- TFLite ---
     tflite_path: Optional[Path] = None
     if not args.no_tflite:
-        tflite_path = export_tflite(best_pt, mobile_out, imgsz=args.imgsz, pose=args.pose, obb=args.obb)
+        tflite_path = export_tflite(best_pt, mobile_out, imgsz=args.imgsz, pose=args.pose, obb=args.obb, seg_2class=args.seg_2class)
         if tflite_path is None:
             sysname = platform.system()
             if sysname == "Windows":
@@ -423,7 +451,7 @@ def main() -> int:
 
     # --- Copy to desktop ---
     if not args.no_copy:
-        copy_to_desktop(onnx_path, pose=args.pose, obb=args.obb)
+        copy_to_desktop(onnx_path, pose=args.pose, obb=args.obb, seg_2class=args.seg_2class)
         # Also copy TFLite if it was produced.
         if tflite_path and tflite_path.exists():
             tflite_dest = DESKTOP_ASSETS / tflite_path.name
