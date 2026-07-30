@@ -26,18 +26,100 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+import types
 from pathlib import Path
+
+# Make CUDA errors synchronous so the real assert message appears in the right place
+os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "1")
 
 WORKSPACE_ROOT: Path = Path(__file__).resolve().parent
 sys.path.insert(0, str(WORKSPACE_ROOT))
+
+# =============================================================================
+# MONKEY-PATCH: Fix TWO bugs in ultralytics 8.4.x tal.py (TaskAlignedAssigner)
+#
+# Bug 1 — get_box_metrics (line ~193):
+#   pd_scores[batch_ind, :, gt_labels.squeeze(-1).long()]
+#   → crashes when any gt_label >= nc (no upper clamp)
+#
+# Bug 2 — get_targets (line ~277):
+#   target_labels.clamp_(0)   ← only clamps min, not max
+#   target_scores.scatter_(2, target_labels.unsqueeze(-1), 1)
+#   → crashes when any target_label >= nc
+#
+# Root cause: mosaic + copy_paste augmentation in ultralytics 8.4.x can
+# produce GT class IDs outside [0, nc-1] for segmentation tasks.
+# Both patches add .clamp(0, nc-1) to prevent CUDA index out-of-bounds.
+# =============================================================================
+def _patch_tal():
+    try:
+        import torch
+        import ultralytics.utils.tal as tal_module
+
+        # ---- Patch 1: get_box_metrics ----------------------------------------
+        def _safe_get_box_metrics(self, pd_scores, pd_bboxes, gt_labels, gt_bboxes, mask_gt):
+            """Patched: clamps gt_labels to [0, nc-1] before indexing pd_scores."""
+            na = pd_bboxes.shape[-2]
+            mask_gt = mask_gt.bool()
+            overlaps = torch.zeros(
+                [self.bs, self.n_max_boxes, na],
+                dtype=pd_bboxes.dtype, device=pd_bboxes.device
+            )
+            bbox_scores = torch.zeros(
+                [self.bs, self.n_max_boxes, na],
+                dtype=pd_scores.dtype, device=pd_scores.device
+            )
+            batch_ind = torch.arange(self.bs, device=pd_scores.device)[:, None]
+            nc = pd_scores.shape[-1]
+            gt_cls_idx = gt_labels.squeeze(-1).long().clamp(0, nc - 1)  # PATCH
+            bbox_scores[mask_gt] = pd_scores[batch_ind, :, gt_cls_idx][mask_gt]
+            pd_boxes = pd_bboxes.unsqueeze(1).expand(-1, self.n_max_boxes, -1, -1)[mask_gt]
+            gt_boxes = gt_bboxes.unsqueeze(2).expand(-1, -1, na, -1)[mask_gt]
+            overlaps[mask_gt] = self.iou_calculation(gt_boxes, pd_boxes)
+            align_metric = bbox_scores.pow(self.alpha) * overlaps.pow(self.beta)
+            return align_metric, overlaps
+
+        tal_module.TaskAlignedAssigner.get_box_metrics = _safe_get_box_metrics
+
+        # ---- Patch 2: get_targets --------------------------------------------
+        def _safe_get_targets(self, gt_labels, gt_bboxes, target_gt_idx, fg_mask):
+            """Patched: clamps target_labels to [0, nc-1] before scatter_.
+            Original code: target_labels.clamp_(0)  ← missing max bound!
+            """
+            batch_ind = torch.arange(
+                end=self.bs, dtype=torch.int64, device=gt_labels.device
+            )[..., None]
+            target_gt_idx = target_gt_idx + batch_ind * self.n_max_boxes
+            target_labels = gt_labels.long().flatten()[target_gt_idx]
+            target_bboxes = gt_bboxes.view(-1, gt_bboxes.shape[-1])[target_gt_idx]
+            nc = self.num_classes
+            target_labels.clamp_(0, nc - 1)  # PATCH: was clamp_(0) — missing max!
+            target_scores = torch.zeros(
+                (target_labels.shape[0], target_labels.shape[1], nc),
+                dtype=torch.int8,
+                device=target_labels.device,
+            )
+            target_scores.scatter_(2, target_labels.unsqueeze(-1), 1)
+            target_scores = target_scores * (fg_mask[:, :, None] > 0)
+            return target_labels, target_bboxes, target_scores
+
+        tal_module.TaskAlignedAssigner.get_targets = _safe_get_targets
+
+        print("[PATCH] ultralytics tal.py: get_box_metrics + get_targets patched (clamp to [0, nc-1])")
+    except Exception as e:
+        print(f"[PATCH] WARNING: Could not patch tal.py: {e}")
+
+_patch_tal()
+# =============================================================================
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train YOLO11-Seg 5-class (per-finger) model.",
     )
-    parser.add_argument("--data", type=str, required=True,
+    parser.add_argument("--data", type=str, default="../nail-segmentation.v2i.yolov11_4438/data.yaml",
                         help="Path to data.yaml (must have 5 classes).")
     parser.add_argument("--model", type=str, default="yolo11n-seg.pt",
                         help="Base model weights (default: yolo11n-seg.pt).")
