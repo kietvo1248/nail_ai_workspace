@@ -78,11 +78,12 @@ def print_info(text: str) -> None:
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-NUM_KEYPOINTS = 4     # Top, Bottom, Left, Right
+NUM_KEYPOINTS = 21    # 21 hand keypoints (MediaPipe skeleton)
 KEYPOINT_DIM = 3      # x, y, visibility
+# Dùng .pt để dùng pretrained backbone, giúp mô hình hội tụ nhanh trên dataset nhỏ.
 DEFAULT_POSE_WEIGHTS = "yolo11n-pose.pt"
-NUM_CLASSES = 1       # nail
-CLASS_NAME = "nail"
+NUM_CLASSES = 1       # hand
+CLASS_NAME = "hand"
 
 
 # =============================================================================
@@ -269,16 +270,34 @@ def train_pose(
         project=str(runs_dir),
         name=run_name,
         device=device,
-        degrees=15.0,
-        translate=0.1,
-        scale=0.5,
-        shear=5.0,
-        flipud=0.0,
+        # ── OPTIMIZER: Sử dụng default cho fine-tuning ──────────────
+        optimizer="auto",
+        # ── LOSS WEIGHTS ──────────────────────
+        pose=15.0,         # Siết chặt hơn (default 12) để ép mô hình bắt điểm thật sát
+        kobj=2.0,          # Ép học độ tin cậy của 21 điểm
+        box=5.0,           # Giảm bớt box để dồn toàn bộ 'sự chú ý' vào keypoints
+        # ── WARMUP ─────────────────────
+        warmup_epochs=3.0,
+        warmup_bias_lr=0.1,
+        # ── AUGMENTATION: Khôi phục lại độ quay và lật theo yêu cầu thực tế
+        degrees=180.0,     # Bàn tay có thể xoay đủ mọi hướng 360 độ (±180)
+        translate=0.05,    # Giảm dịch chuyển để bàn tay luôn ở giữa khung hình
+        scale=0.2,         # Giảm phóng to/thu nhỏ quá đà để giữ nguyên form tay
+        shear=3.0,
+        perspective=0.0,
+        flipud=0.5,        # Bật lại lộn ngược vì camera có thể chĩa từ trên xuống
         fliplr=0.5,
-        patience=20,
+        mosaic=0.5,        # Giảm mosaic (trước=1.0) để ảnh đơn chiếm 50% để học chính xác
+        mixup=0.0,
+        copy_paste=0.0,
+        # ── GENERAL ──────────────────────────────────────────────────────────
+        patience=80,       # Kiên nhẫn hơn vì keypoint cần nhiều epoch để hội tụ
+        amp=False,
+        workers=2,
         save=True,
         save_period=10,
         verbose=True,
+        close_mosaic=20,   # Tắt mosaic ở 20 epoch cuối để fine-tune chính xác
     )
 
     print_header("POSE TRAINING COMPLETE")
@@ -300,6 +319,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default=None, help="Device (auto-detect if None)")
     parser.add_argument("--weights", type=str, default=DEFAULT_POSE_WEIGHTS,
                         help="Pretrained pose weights")
+    parser.add_argument("--data", type=str, default=None, help="Path to dataset directory")
     parser.add_argument("--name", type=str, default="nail_pose",
                         help="Run name prefix")
     return parser.parse_args()
@@ -309,7 +329,7 @@ def main() -> int:
     print_header("YOLOV11-POSE NAIL AR - TRAINING")
     args = parse_args()
 
-    dataset = select_dataset()
+    dataset = Path(args.data).resolve() if args.data else select_dataset()
     device = args.device if args.device is not None else scan_gpus()
 
     train_pose(

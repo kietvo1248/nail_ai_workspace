@@ -9,9 +9,9 @@ Workflow:
     4. Attempt TFLite/LiteRT export (platform-dependent; see below).
     5. Auto-copy the ONNX file into ``nail_desktop_app/assets/`` (override via --no-copy).
 
-For Pose models (Phase 1 + Phase 7):
-    Use --pose to export a YOLO11-Pose run. Pass ``--kpt-shape 4 3`` so the
-    exported ONNX contains 4 keypoints (Top, Bottom, Left, Right).
+For Pose models (Phase 1 + Phase 7 + 21-point Hand Pose):
+    Use --pose to export a YOLO11-Pose run. Pass ``--kpt-shape 21 3`` so the
+    exported ONNX contains 21 keypoints (Hand Skeleton).
 
 For OBB models (Phase 8 - OBB refactor):
     Use --obb to export a YOLO11-OBB run. The output is ``nail_obb.onnx`` or
@@ -134,8 +134,8 @@ def export_onnx(
                 opset=20,
                 kpt_shape=list(kpt_shape),
             )
-        except TypeError:
-            # Older Ultralytics: kpt_shape auto-detected from the .pt.
+        except (TypeError, SyntaxError):
+            # Ultralytics: kpt_shape auto-detected from the .pt.
             exported_path = model.export(
                 format="onnx", imgsz=imgsz, simplify=False, opset=20
             )
@@ -213,6 +213,7 @@ def _export_tflite_windows(
     pose: bool = False,
     obb: bool = False,
     seg_2class: bool = False,
+    kpt_shape: tuple[int, int] = (21, 3),
 ) -> Optional[Path]:
     """Windows-only: ONNX -> TFLite via onnx2tf."""
     os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
@@ -252,13 +253,23 @@ def _export_tflite_windows(
     try:
         from ultralytics import YOLO
         model = YOLO(str(best_pt))
-        export_target = model.export(
-            format="onnx",
-            imgsz=imgsz,
-            simplify=True,
-            opset=20,
-            batch=1,
-        )
+        
+        export_kwargs = {
+            "format": "onnx",
+            "imgsz": imgsz,
+            "simplify": True,
+            "opset": 20,
+            "batch": 1,
+        }
+        if pose:
+            export_kwargs["kpt_shape"] = list(kpt_shape)
+            
+        try:
+            export_target = model.export(**export_kwargs)
+        except (TypeError, SyntaxError):
+            # Fallback for older Ultralytics versions
+            export_kwargs.pop("kpt_shape", None)
+            export_target = model.export(**export_kwargs)
         export_target = Path(export_target)
         if export_target.resolve() != static_onnx.resolve():
             shutil.move(str(export_target), str(static_onnx))
@@ -380,7 +391,7 @@ def parse_args() -> argparse.Namespace:
                         help="Export a Seg model (default when neither --pose nor --obb is set)")
     parser.add_argument("--seg-2class", action="store_true",
                         help="Export a Seg 2-class model (nail_bed + full_nail)")
-    parser.add_argument("--kpt-shape", type=int, nargs=2, default=[4, 3],
+    parser.add_argument("--kpt-shape", type=int, nargs=2, default=[21, 3],
                         help="Pose keypoint shape: <num_keypoints> <keypoint_dim>")
     return parser.parse_args()
 
@@ -410,11 +421,15 @@ def main() -> int:
         run_dir = pick_run(runs)
 
     best_pt = run_dir / "weights" / "best.pt"
-    if args.obb:
+    run_name_lower = run_dir.name.lower()
+    if args.obb or "obb" in run_name_lower:
+        args.obb = True
         mode_label = "OBB"
-    elif args.pose:
+    elif args.pose or "pose" in run_name_lower:
+        args.pose = True
         mode_label = "Pose"
-    elif args.seg_2class:
+    elif args.seg_2class or "2class" in run_name_lower:
+        args.seg_2class = True
         mode_label = "Seg 2-class"
     else:
         mode_label = "Seg"

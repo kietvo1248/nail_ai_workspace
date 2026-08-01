@@ -702,8 +702,25 @@ def _run_seg_legacy(dataset_path: Path) -> None:
 
 def _run_pose_legacy() -> None:
     """Run the legacy Pose training script via subprocess."""
-    print_header("TRAIN POSE (LEGACY)")
-    rc = _run_subprocess("train_pose.py")
+    print_header("TRAIN POSE (Hand Pose - 21 keypoints)")
+    
+    # 1. Chọn Dataset trước
+    dataset_path = _pick_dataset_path()
+    print_info(f"Sử dụng dataset: {dataset_path}")
+    
+    # 2. Chọn thông số Train sau
+    epochs, imgsz, batch, device = _prompt_train_params(
+        default_epochs=100, default_imgsz=640, default_batch=8
+    )
+    
+    rc = _run_subprocess(
+        "train_pose.py",
+        "--data", str(dataset_path),
+        "--epochs", epochs,
+        "--imgsz", imgsz,
+        "--batch", batch,
+        "--device", device,
+    )
     if rc != 0:
         print_error(f"train_pose.py exited with code {rc}")
 
@@ -988,7 +1005,7 @@ def main():
         "Train OBB (smoke test) - 139 ảnh",     # 2
         "Train OBB (production) - 10,501 ảnh",  # 3
         "Train OBB 5-class (finger names)",     # 4
-        "Train Pose (legacy, 4 keypoints)",     # 5
+        "Train Pose (Hand Pose - 21 keypoints)",# 5
         "Resume training (đã có last.pt)",       # 6
         "Train Seg 5-class (Native + Math Extraction)", # 7
     ]

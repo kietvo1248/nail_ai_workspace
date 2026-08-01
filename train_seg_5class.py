@@ -215,7 +215,8 @@ def main() -> int:
         verbose=True,
         amp=False,             # Disable AMP to prevent CUDA misaligned address error
         # Augmentation parameters identical to OBB for maximum robustness
-        degrees=args.degrees,
+        # degrees=args.degrees,
+        degrees=180.0,
         translate=0.2,
         scale=0.9,
         shear=10.0,
