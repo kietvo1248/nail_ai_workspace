@@ -1,8 +1,13 @@
-# Nail AI Workspace (YOLO11 - Segmentation / Pose)
+# Nail AI Workspace (YOLO11 - Seg / Pose / OBB)
 
 Workspace chứa toàn bộ script training & export mô hình YOLO11 dùng cho
 **Tryon-Nail Detector** (phát hiện & phân vùng móng tay, 5 classes: index /
 middle / pinky / ring / thumb).
+
+> **Pipeline OBB (khuyến nghị cho AR nail try-on):** Mô hình mới dùng
+> **YOLO11-OBB** (Oriented Bounding Box) để đo được **góc xoay chính xác**
+> của móng. Khi train xong, ứng dụng desktop sẽ dùng góc này để xoay móng
+> fake theo hướng ngón tay thật — thay vì dùng `cv2.minAreaRect` (dễ sai).
 
 > **Lưu ý:** Repo này **CHỈ chứa source code**. Các thư lớn như
 > `venv311/`, `runs/`, `mobile_model/`, file `*.pt` / `*.onnx` / `*.tflite`
@@ -23,16 +28,21 @@ nail_ai_workspace/
 ├── data.yaml                     # Config dataset (1 class: nail, dùng cho detect/seg)
 ├── data_Nail_v1i_yolov11.yaml    # Config dataset 5 classes (dùng cho fine-tune 5 ngón)
 │
-├── train.py                      # Train YOLO11-Seg (interactive, tự quét GPU & dataset)
+├── train.py                      # Menu training (Seg / OBB / Pose / 5-class / Resume)
 ├── train_seg.py                  # Train YOLO11-Seg (CLI mode, dễ chạy trên server)
 ├── train_pose.py                 # Train YOLO11-Pose (4 keypoints: top/bottom/left/right)
 ├── train_finetune_5class.py      # Fine-tune từ best.pt cũ với 5 classes (cls=2.0, fliplr=0)
 ├── train_from_scratch_5class.py  # Train từ đầu với 5 classes
+├── train_obb.py                  # Train YOLO11-OBB (1 class) - khuyến nghị cho AR
+├── train_obb_5class.py           # Train YOLO11-OBB 5-class (label ngón tay)
+│
+├── convert_seg_to_obb.py         # Convert YOLO-Seg polygon -> YOLO-OBB 4 corners
+├── auto_split.py                 # Tự tách train/val 80/20 nếu dataset chỉ có train/
 │
 ├── export_model.py               # Export best.pt -> TFLite (legacy, dùng cho Pose)
-├── export_all.py                 # Export ONNX + TFLite (khuyến nghị dùng)
+├── export_all.py                 # Export ONNX + TFLite (khuyến nghị dùng, có --obb)
 ├── export_tflite.py              # Export ONNX (LiteRT cố gắng thêm nếu Linux/macOS)
-├── test_inference.py             # Test model trên ảnh, vẽ bbox + keypoint
+├── test_inference.py             # Test model trên ảnh (pose / obb / seg), vẽ bbox + keypoint/OBB
 │
 ├── TFLITE_WINDOWS.md             # Ghi chú khi export TFLite trên Windows
 │
@@ -139,50 +149,104 @@ Nếu đặt dataset chỗ khác, truyền `--data <path/data.yaml>` khi train.
 
 ## 4. Workflow training
 
-### 4.1. Train YOLO11-Seg (interactive, 1 class)
+### 4.0. Quick-start (khuyến nghị — YOLO11-OBB cho AR nail try-on)
 
-```bash
-python train.py
+Mặc định `python train.py` sẽ hiện **menu 6 chế độ**:
+
+```
+[1] Train Seg (legacy, 1-class)
+[2] Train OBB (smoke test)        ← 139 ảnh, nhanh, verify pipeline
+[3] Train OBB (production)        ← 10,501 ảnh
+[4] Train OBB 5-class             ← 5-class OBB cho label ngón
+[5] Train Pose (legacy, 4 kp)
+[6] Resume training               ← tự động phát hiện last.pt khi chạy
 ```
 
-Script sẽ hỏi: chọn dataset → chọn epochs/imgsz/batch → chọn GPU → train.
-Phù hợp khi chạy trên máy local, muốn tương tác.
+Các script OBB ([2]–[4]) tự động:
+- Convert YOLO-Seg polygon → YOLO-OBB 4 corners (`convert_seg_to_obb.py`).
+- Tách train/val 80/20 nếu dataset chỉ có `train/` (`auto_split.py`).
 
-### 4.2. Train YOLO11-Seg (CLI, dễ chạy trên server)
+Nên dùng chế độ `[2]` để smoke test pipeline với 139 ảnh trước, sau đó
+chuyển sang `[3]` cho production.
+
+### 4.1. Train YOLO11-OBB (smoke test, 139 ảnh)
 
 ```bash
-python train_seg.py --epochs 100 --imgsz 416 --batch 16 --device 0
+# Cách 1: dùng menu
+python train.py            # rồi chọn [2]
+
+# Cách 2: CLI trực tiếp
+python train_obb.py --data ../Nail_Detection_ThanhDT.v1i.yolov11/data.yaml --epochs 20 --imgsz 416
 ```
 
-### 4.3. Train YOLO11-Pose (4 keypoints)
+Augmentation đã được tinh chỉnh cho OBB:
+
+| Aug | Value | Lý do |
+|---|---|---|
+| `degrees` | **180** | Xoay đủ 360° - OBB model đã học invariance với rotation |
+| `fliplr` | **0.0** | Tắt flip ngang - tránh thumb↔pinky confusion |
+| `mosaic` | 1.0 | OBB model train mosaic tốt hơn Seg |
+| `mixup` | 0.15 | Đa dạng ảnh |
+| `copy_paste` | 0.3 | Augmentation copy ngón từ ảnh khác → đa dạng góc |
+| `erasing` | 0.4 | Cutout chống overfit |
+| `cls` | 2.0 | Tăng weight classification loss |
+
+### 4.2. Train YOLO11-OBB (production, 10,501 ảnh)
 
 ```bash
+python train.py            # rồi chọn [3]
+# hoặc:
+python train_obb.py --data ../nail-segmentation.v1i.yolov11_10501/data.yaml --epochs 150 --imgsz 640
+```
+
+### 4.3. Train YOLO11-OBB 5-class (label tên ngón)
+
+```bash
+python train.py            # rồi chọn [4]
+# hoặc:
+python train_obb_5class.py --data ../nail-segmentation.v1i.yolov11_10501/data.yaml --epochs 150 --imgsz 640
+```
+
+Cùng augmentation như 4.1, nhưng `fliplr=0.0` được hard-lock để tránh
+nhầm ngón (thumb ↔ pinky khi flip ngang).
+
+### 4.4. Train YOLO11-Seg (legacy)
+
+```bash
+python train.py            # rồi chọn [1] - interactive
+python train_seg.py --epochs 100 --imgsz 416 --batch 16 --device 0   # CLI
+```
+
+Giữ lại để backward-compat với pipeline cũ (overlay cũ dùng `minAreaRect`).
+
+### 4.5. Train YOLO11-Pose (4 keypoints, legacy)
+
+```bash
+python train.py            # rồi chọn [5]
 python train_pose.py --epochs 100 --imgsz 416 --batch 16
 ```
 
-### 4.4. Fine-tune 5 classes (sửa classification từ run cũ)
+Pose model là option dự phòng. Khuyến nghị dùng **OBB** thay vì Pose vì
+OBB cho angle chính xác hơn (Pose 4 keypoints Top/Bottom/Left/Right rất
+nhạy với nhiễu).
 
-```bash
-python train_finetune_5class.py
-```
-
-Mặc định sẽ tự tìm `best.pt` mới nhất trong `runs/`. Để chỉ định:
+### 4.6. Fine-tune 5 classes từ run cũ
 
 ```bash
 python train_finetune_5class.py --base runs/<ten_run>/weights/best.pt
 ```
 
-Hyperparameter đã được tinh chỉnh cho 5 ngón tay:
-- `cls=2.0` — tăng weight class loss
-- `fliplr=0.0` — tắt flip ngang (tránh đảo thumb↔pinky)
-- `degrees=30` — xoay đa hướng
-- `mosaic=0.8`, `mixup=0.1` — augmentation cân bằng
+Hyperparameter: `cls=2.0`, `fliplr=0.0`, `degrees=30`, `mosaic=0.8`.
 
-### 4.5. Train 5 classes từ đầu
+### 4.7. Train 5 classes từ đầu
 
 ```bash
 python train_from_scratch_5class.py --epochs 150 --imgsz 640
 ```
+
+### 4.8. Resume training sau khi crash
+
+Chạy lại `python train.py` - script tự phát hiện `last.pt` và hỏi resume.
 
 ---
 
@@ -196,11 +260,14 @@ python export_all.py
 python export_all.py --run nail-segmentation_v1i_yolov11_10501_20260726_194607
 # Pose model:
 python export_all.py --pose --kpt-shape 4 3
+# OBB model (cho AR nail try-on):
+python export_all.py --obb --run <ten_run_obb>
 ```
 
 Output nằm ở `mobile_model/<ten_run>/`:
-- `nail_seg.onnx` / `nail_pose.onnx` — cho Desktop + ONNX Runtime
+- `nail_seg.onnx` / `nail_pose.onnx` / `nail_obb.onnx` — cho Desktop + ONNX Runtime
 - `nail_seg_float16.tflite` / `nail_pose_float16.tflite` — cho mobile (Linux/macOS)
+- `nail_obb_float16.tflite` — OBB model cho mobile (Linux/macOS)
 
 > **Trên Windows:** LiteRT/TFLite sẽ tự fallback sang pipeline ONNX → onnx2tf
 > (xem `TFLITE_WINDOWS.md`). Nếu chỉ cần ONNX, dùng `--no-tflite`.
@@ -208,10 +275,21 @@ Output nằm ở `mobile_model/<ten_run>/`:
 ### 5.2. Test inference nhanh
 
 ```bash
-python test_inference.py --model runs/<ten_run>/weights/best.pt --image <path/to/test.jpg>
+# Pose model:
+python test_inference.py --model runs/<ten_run>/weights/best.pt --task pose --image <path/to/test.jpg>
+# OBB model:
+python test_inference.py --model runs/<ten_run>/weights/best.pt --task obb --image <path/to/test.jpg>
+# Seg model:
+python test_inference.py --model runs/<ten_run>/weights/best.pt --task seg --image <path/to/test.jpg>
 ```
 
-Sẽ vẽ bbox + 4 keypoint, lưu ảnh output vào `output/`.
+Sẽ vẽ:
+- **pose**: bbox + 4 keypoint (Top/Bottom/Left/Right), lưu vào `output/`.
+- **obb**:  oriented rectangle (4 corners) + rotation arrow từ bbox center
+  theo góc `angle_deg` - kiểm tra được model đoán góc đúng chưa.
+- **seg**:  bbox + mask polygon (legacy).
+
+Output file: `output/<image>_<task>_result.jpg`.
 
 ---
 
@@ -259,6 +337,40 @@ Sẽ vẽ bbox + 4 keypoint, lưu ảnh output vào `output/`.
 
 ### Resume training sau khi crash
 → Chạy lại `python train.py` — script tự phát hiện `last.pt` và hỏi resume.
+
+### OBB model predict sai góc xoay (fake nail xoay bậy)
+**Triệu chứng:** overlay xoay 180° ngược chiều, hoặc góc xoay bị giật.
+
+**Nguyên nhân phổ biến:**
+1. **Sai thứ tự 4 corners OBB trong label.** Ultralytics OBB dùng
+   convention `[BR, TR, TL, BL]`. Nếu `convert_seg_to_obb.py` sort sai,
+   model sẽ học góc nghịch đảo.
+2. **Cls 0 (`Index` viết hoa)** trong smoke test dataset có 1 mẫu - đây
+   là class rác từ Roboflow. Khi train production với dataset 5-class
+   sạch (`nail-segmentation.v1i.yolov11_10501`), class này không còn.
+3. **Augmentation xoay quá yếu** (`degrees < 90°`) - model chưa học
+   invariance với rotation. Khuyến nghị `degrees=180` cho OBB.
+4. **Top/Bottom ambiguity:** OBB 4 góc không phân biệt được "đầu móng"
+   vs "gốc móng". `NailOverlayRenderer._paste_overlay` đã có heuristic
+   fallback: nếu `|model_angle - minAreaRect_angle| > 90°` thì flip 180°.
+
+**Cách debug:**
+- Chạy `python test_inference.py --task obb --model runs/.../best.pt --image test.jpg`.
+- Kiểm tra rotation arrow (yellow) có chỉ đúng chiều móng không.
+- Nếu sai, kiểm tra lại `convert_seg_to_obb.py` có sort đúng `[BR, TR, TL, BL]` không.
+- Kiểm tra ảnh `runs/<run>/train_batch*.jpg` để xem label OBB có đúng chiều sau augmentation không.
+
+### So sánh augmentation Seg vs OBB
+
+| Aug | Seg (legacy) | OBB (mới) | Lý do |
+|---|---|---|---|
+| `degrees` | 15–30 | **180** | OBB model học rotation invariance tốt hơn với xoay mạnh |
+| `fliplr` | 0.5 | **0.0** | Tránh thumb↔pinky confusion khi flip ngang |
+| `mosaic` | 0.8 | **1.0** | OBB model train mosaic tốt hơn Seg |
+| `mixup` | 0.0–0.1 | **0.15** | Cân bằng dataset |
+| `copy_paste` | — | **0.3** | Đa dạng góc xoay ngón tay |
+| `erasing` | — | **0.4** | Cutout chống overfit pixel cụ thể |
+| `cls` | 1.0 (mặc định) | **2.0** | Tăng weight classification loss |
 
 ---
 

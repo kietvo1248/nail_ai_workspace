@@ -1,35 +1,39 @@
 """
 ================================================================================
-TEST_INFERENCE.PY - Visual Debug Tool for Nail Keypoint Detection
+TEST_INFERENCE.PY - Visual Debug Tool for Nail Keypoint / OBB Detection
 ================================================================================
 Script debug nội bộ dùng OpenCV để visualize kết quả inference.
 
 **Công dụng:**
   - Load một ảnh test bất kỳ
   - Chạy inference với best.pt
-  - Vẽ Bounding Box và 4 Keypoints lên ảnh
+  - Vẽ Bounding Box + 4 Keypoints (Pose) HOẶC Oriented Rectangle + angle arrow (OBB)
   - Lưu ảnh kết quả để kỹ sư kiểm tra bằng mắt (Visual Inspection)
   - Hỗ trợ team Mobile xác minh model hoạt động đúng trước khi deploy
 
-**Visual Output:**
-  - Bounding Box: Màu xanh lá (nail detected)
-  - Keypoints: 4 điểm màu đỏ với nhãn (Top, Bottom, Left, Right)
-  - Visibility: Điểm mờ = không nhìn thấy, Điểm sáng = nhìn thấy
+**Visual Output theo task:**
+  - ``pose``: Bounding Box + 4 Keypoints (Top, Bottom, Left, Right)
+  - ``obb``:  Oriented rectangle (4 corners) + rotation arrow từ bbox center
+              theo góc ``angle_deg``.
+  - ``seg``:  (legacy) Bounding Box + segmentation mask polygon
 
 **Hỗ trợ External Dataset & Model:**
   - --model: Đường dẫn đến best.pt
   - --image: Đường dẫn ảnh test cụ thể
+  - --task:  pose (default) | obb | seg
 ================================================================================
 """
+
+import argparse
+import glob
+import math
+import os
+import sys
+from pathlib import Path
 
 import cv2
 import numpy as np
 from ultralytics import YOLO
-import os
-import sys
-import glob
-import argparse
-from pathlib import Path
 
 
 # =============================================================================
@@ -39,6 +43,9 @@ from pathlib import Path
 # Màu sắc cho visualization (BGR format cho OpenCV)
 COLORS = {
     "bbox": (0, 255, 0),          # Xanh lá - Bounding Box
+    "obb": (0, 255, 255),         # Vàng - Oriented rectangle
+    "obb_corner": (0, 200, 255),  # Cam nhạt - OBB corner
+    "obb_arrow": (255, 100, 100), # Đỏ nhạt - rotation arrow
     "keypoint_visible": (0, 0, 255),  # Đỏ - Keypoint nhìn thấy
     "keypoint_occluded": (128, 128, 128),  # Xám - Keypoint bị che
     "text": (255, 255, 255),      # Trắng - Text
@@ -58,7 +65,7 @@ VISIBILITY_THRESHOLD = 0.5
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Test YOLOv11-Pose inference with visual output"
+        description="Test YOLO inference (Pose/OBB/Seg) with visual output"
     )
     parser.add_argument(
         "--model", "-m",
@@ -100,6 +107,12 @@ def parse_args():
         type=str,
         default="runs",
         help="Project folder to search for best.pt (default: runs)"
+    )
+    parser.add_argument(
+        "--task",
+        choices=["pose", "obb", "seg"],
+        default="pose",
+        help="Inference task: pose (4 keypoints), obb (oriented bbox), seg (legacy). Default: pose.",
     )
     return parser.parse_args()
 
@@ -159,21 +172,21 @@ def find_test_image(default_path: str = "dataset/images/val") -> str:
 def draw_bbox(frame: np.ndarray, box: np.ndarray, conf: float) -> None:
     """
     Vẽ Bounding Box lên ảnh.
-    
+
     Args:
         frame: Ảnh numpy (OpenCV format BGR)
         box: Bounding box [x1, y1, x2, y2]
         conf: Confidence score
     """
     x1, y1, x2, y2 = map(int, box)
-    
+
     # Vẽ rectangle
     cv2.rectangle(frame, (x1, y1), (x2, y2), COLORS["bbox"], 2)
-    
+
     # Vẽ nhãn với background
     label = f"nail {conf:.2f}"
     label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-    
+
     # Background cho text
     cv2.rectangle(
         frame,
@@ -182,12 +195,87 @@ def draw_bbox(frame: np.ndarray, box: np.ndarray, conf: float) -> None:
         COLORS["bbox"],
         -1
     )
-    
+
     # Text
     cv2.putText(
         frame, label,
         (x1 + 5, y1 - 5),
         cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLORS["text"], 2
+    )
+
+
+def draw_obb(
+    frame: np.ndarray,
+    xyxyxyxy: np.ndarray,
+    xywhr: np.ndarray,
+    cls_id: int,
+    cls_name: str,
+    conf: float,
+) -> None:
+    """Draw oriented bounding box: 4 corners + rotation arrow + label.
+
+    Args:
+        frame: BGR image
+        xyxyxyxy: shape (4, 2) - 4 (x, y) corners in image coords. Order is
+            whatever Ultralytics gives (BR, TR, TL, BL in 8.4.x).
+        xywhr: shape (5,) - (cx, cy, w, h, angle_rad)
+        cls_id / cls_name: classification info (for the label text)
+        conf: detection confidence
+    """
+    if xyxyxyxy is None or len(xyxyxyxy) < 4:
+        return
+
+    # Draw the oriented rectangle.
+    pts = np.asarray(xyxyxyxy, dtype=np.float32).reshape(-1, 1, 2)
+    cv2.polylines(frame, [pts.astype(np.int32)], isClosed=True, color=COLORS["obb"], thickness=2)
+
+    # Draw each corner with a small filled circle.
+    for px, py in xyxyxyxy:
+        cv2.circle(frame, (int(px), int(py)), 4, COLORS["obb_corner"], -1, cv2.LINE_AA)
+        cv2.circle(frame, (int(px), int(py)), 4, (50, 50, 50), 1, cv2.LINE_AA)
+
+    # Rotation arrow from bbox center along angle_deg.
+    cx, cy, w, h, angle_rad = xywhr
+    if abs(angle_rad) > 0.01:
+        length = max(w, h) * 0.55
+        rad = float(angle_rad)
+        # Image-space arrow direction. Ultralytics' angle convention for OBB
+        # is a CCW rotation in radians; convert to (dx, dy) for cv2.arrowedLine.
+        dx = math.cos(rad) * length
+        dy = math.sin(rad) * length
+        ex = cx + dx
+        ey = cy + dy
+        cv2.arrowedLine(
+            frame,
+            (int(round(cx)), int(round(cy))),
+            (int(round(ex)), int(round(ey))),
+            COLORS["obb_arrow"],
+            2,
+            tipLength=0.25,
+        )
+
+    # Label at first corner (BR).
+    x0 = int(round(float(xyxyxyxy[0][0])))
+    y0 = int(round(float(xyxyxyxy[0][1])))
+    label = f"{cls_name} {conf:.2f} ang={math.degrees(angle_rad):.1f}"
+    label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+    # Background box above the label anchor.
+    cv2.rectangle(
+        frame,
+        (x0, max(0, y0 - label_size[1] - 8)),
+        (x0 + label_size[0] + 8, y0),
+        COLORS["obb"],
+        -1,
+    )
+    cv2.putText(
+        frame,
+        label,
+        (x0 + 4, max(12, y0 - 4)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (0, 0, 0),  # Black text on yellow background
+        1,
+        cv2.LINE_AA,
     )
 
 
@@ -252,7 +340,8 @@ def run_inference(
     conf_threshold: float = CONFIDENCE_THRESHOLD,
     save_output: bool = True,
     output_dir: str = "output",
-    imgsz: int = 320
+    imgsz: int = 320,
+    task: str = "pose",
 ) -> None:
     """
     Chạy inference và visualize kết quả.
@@ -264,6 +353,7 @@ def run_inference(
         save_output: Lưu ảnh kết quả
         output_dir: Thư mục lưu ảnh output
         imgsz: Kích thước input model
+        task: ``pose`` | ``obb`` | ``seg``
     """
     # Load model
     print(f"[INFO] Loading model from: {model_path}")
@@ -276,72 +366,86 @@ def run_inference(
     if frame is None:
         raise ValueError(f"[ERROR] Cannot load image: {image_path}")
 
-    # Resize về kích thước model (320x320) để inference
     original_h, original_w = frame.shape[:2]
 
     # Chạy inference
-    print("[INFO] Running inference...")
+    print(f"[INFO] Running inference (task={task})...")
     results = model.predict(
         image_path,
         conf=conf_threshold,
         imgsz=imgsz,
-        verbose=False
+        verbose=False,
     )
-    
+
     # Tạo thư mục output nếu cần
     if save_output:
         os.makedirs(output_dir, exist_ok=True)
-    
+
     # Xử lý kết quả
     result = results[0]
     boxes = result.boxes
-    keypoints = result.keypoints
-    
-    print(f"[INFO] Detections: {len(boxes)}")
-    
-    if len(boxes) > 0 and keypoints is not None:
-        for i, (box, kp) in enumerate(zip(boxes, keypoints)):
-            # Lấy thông tin box
-            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-            conf = float(box.conf[0].cpu().numpy())
-            
-            print(f"[DETECTION {i+1}]")
-            print(f"  - Bounding Box: [{x1:.1f}, {y1:.1f}, {x2:.1f}, {y2:.1f}]")
-            print(f"  - Confidence:   {conf:.3f}")
-            
-            # Vẽ Bounding Box
-            draw_bbox(frame, (x1, y1, x2, y2), conf)
-            
-            # Keypoints data
-            kp_data = kp.data[0].cpu().numpy()  # Shape: [4, 3]
-            
-            print(f"  - Keypoints:")
-            for j, (name, kp_vals) in enumerate(zip(KEYPOINT_NAMES, kp_data)):
-                x, y, visible = kp_vals
-                vis_status = "visible" if visible >= VISIBILITY_THRESHOLD else "occluded"
-                print(f"    [{j}] {name}: x={x:.3f}, y={y:.3f}, visible={visible:.3f} ({vis_status})")
-            
-            # Vẽ Keypoints
-            draw_keypoints(frame, kp_data, (x1, y1, x2, y2))
-            
-            # Vẽ thông tin lên ảnh
-            info_text = f"Top=({kp_data[0][0]:.2f}, {kp_data[0][1]:.2f})"
-            cv2.putText(frame, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    boxes_len = 0 if boxes is None else len(boxes)
+    print(f"[INFO] Detections: {boxes_len}")
+
+    if boxes_len > 0:
+        if task == "obb" and hasattr(result, "obb") and result.obb is not None:
+            for i, (box, obb) in enumerate(zip(boxes, result.obb)):
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                conf = float(box.conf[0].cpu().numpy())
+                cls_id = int(box.cls[0].cpu().numpy()) if hasattr(box, "cls") else 0
+                cls_name = result.names.get(cls_id, f"class_{cls_id}") if hasattr(result, "names") else f"class_{cls_id}"
+
+                # Draw the conventional axis-aligned bbox first for context.
+                draw_bbox(frame, (x1, y1, x2, y2), conf)
+
+                # Draw the oriented rectangle on top.
+                corners = obb.xyxyxyxy.cpu().numpy().reshape(-1, 2)
+                xywhr = obb.xywhr.cpu().numpy().reshape(-1)
+                print(f"[DETECTION {i + 1}] cls={cls_name} conf={conf:.3f} "
+                      f"angle={math.degrees(float(xywhr[4])):.2f}deg "
+                      f"size=({float(xywhr[2]):.1f}, {float(xywhr[3]):.1f})")
+                draw_obb(frame, corners, xywhr, cls_id, cls_name, conf)
+        elif task == "pose" and result.keypoints is not None:
+            for i, (box, kp) in enumerate(zip(boxes, result.keypoints)):
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                conf = float(box.conf[0].cpu().numpy())
+                print(f"[DETECTION {i + 1}]")
+                print(f"  - Bounding Box: [{x1:.1f}, {y1:.1f}, {x2:.1f}, {y2:.1f}]")
+                print(f"  - Confidence:   {conf:.3f}")
+                draw_bbox(frame, (x1, y1, x2, y2), conf)
+                kp_data = kp.data[0].cpu().numpy()  # Shape: [4, 3]
+                print(f"  - Keypoints:")
+                for j, (name, kp_vals) in enumerate(zip(KEYPOINT_NAMES, kp_data)):
+                    x, y, visible = kp_vals
+                    vis_status = "visible" if visible >= VISIBILITY_THRESHOLD else "occluded"
+                    print(f"    [{j}] {name}: x={x:.3f}, y={y:.3f}, visible={visible:.3f} ({vis_status})")
+                draw_keypoints(frame, kp_data, (x1, y1, x2, y2))
+                info_text = f"Top=({kp_data[0][0]:.2f}, {kp_data[0][1]:.2f})"
+                cv2.putText(frame, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        else:
+            # Legacy / Seg path: draw bbox only (seg mask was the previous default).
+            for i, box in enumerate(boxes):
+                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                conf = float(box.conf[0].cpu().numpy())
+                print(f"[DETECTION {i + 1}]")
+                print(f"  - Bounding Box: [{x1:.1f}, {y1:.1f}, {x2:.1f}, {y2:.1f}]")
+                print(f"  - Confidence:   {conf:.3f}")
+                draw_bbox(frame, (x1, y1, x2, y2), conf)
     else:
         print("[WARNING] No detections found in the image!")
         cv2.putText(
             frame, "No nail detected",
-            (frame.shape[1]//2 - 100, frame.shape[0]//2),
-            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2
+            (frame.shape[1] // 2 - 100, frame.shape[0] // 2),
+            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2,
         )
-    
+
     # Lưu ảnh kết quả
     if save_output:
         # Tạo tên file output
         base_name = os.path.basename(image_path)
         name_without_ext = os.path.splitext(base_name)[0]
-        output_path = os.path.join(output_dir, f"{name_without_ext}_result.jpg")
-        
+        output_path = os.path.join(output_dir, f"{name_without_ext}_{task}_result.jpg")
+
         cv2.imwrite(output_path, frame)
         print(f"\n[SUCCESS] Result saved to: {os.path.abspath(output_path)}")
     
@@ -408,17 +512,28 @@ def main():
             image_path=image_path,
             conf_threshold=args.conf,
             save_output=not args.no_save,
-            output_dir=args.output
+            output_dir=args.output,
+            imgsz=args.imgsz,
+            task=args.task,
         )
 
-        print("\n" + "="*60)
+        print("\n" + "=" * 60)
         print(" VISUAL INSPECTION CHECKLIST")
-        print("="*60)
-        print(" [ ] Bounding Box bao quanh móng tay chính xác?")
-        print(" [ ] 4 Keypoints (Top, Bottom, Left, Right) đúng vị trí?")
-        print(" [ ] Keypoints không bị lệch khỏi móng?")
-        print(" [ ] Visibility của các điểm đúng (visible vs occluded)?")
-        print("="*60)
+        print("=" * 60)
+        if args.task == "obb":
+            print(" [ ] Oriented rectangle bao quanh móng đúng hướng?")
+            print(" [ ] Rotation arrow (yellow) chỉ theo chiều móng?")
+            print(" [ ] Góc angle_deg hợp lý (-90 .. 90)?")
+            print(" [ ] 4 corners của OBB không bị sort ngược (so với minAreaRect)?")
+        elif args.task == "pose":
+            print(" [ ] Bounding Box bao quanh móng tay chính xác?")
+            print(" [ ] 4 Keypoints (Top, Bottom, Left, Right) đúng vị trí?")
+            print(" [ ] Keypoints không bị lệch khỏi móng?")
+            print(" [ ] Visibility của các điểm đúng (visible vs occluded)?")
+        else:
+            print(" [ ] Bounding Box bao quanh móng đúng vị trí?")
+            print(" [ ] Mask polygon khớp biên móng?")
+        print("=" * 60)
 
     except FileNotFoundError as e:
         print(f"\n{str(e)}")

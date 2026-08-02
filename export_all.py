@@ -9,9 +9,17 @@ Workflow:
     4. Attempt TFLite/LiteRT export (platform-dependent; see below).
     5. Auto-copy the ONNX file into ``nail_desktop_app/assets/`` (override via --no-copy).
 
-For Pose models (Phase 1 + Phase 7):
-    Use --pose to export a YOLO11-Pose run. Pass ``--kpt-shape 4 3`` so the
-    exported ONNX contains 4 keypoints (Top, Bottom, Left, Right).
+For Pose models (Phase 1 + Phase 7 + 21-point Hand Pose):
+    Use --pose to export a YOLO11-Pose run. Pass ``--kpt-shape 21 3`` so the
+    exported ONNX contains 21 keypoints (Hand Skeleton).
+
+For OBB models (Phase 8 - OBB refactor):
+    Use --obb to export a YOLO11-OBB run. The output is ``nail_obb.onnx`` or
+    ``nail_obb_5class.onnx`` depending on whether the run name suggests a
+    5-class model. The 4 corner coordinates + 1 angle per detection are
+    exported as a [1, C, N] tensor where C = 4 (4 corners * 2) + 1 (angle) +
+    num_classes + 1 (objectness). The desktop app parses this via
+    ``onnx_inference._parse_obb``.
 
 Platform notes:
   - ONNX: works everywhere (recommended for mobile - ONNX Runtime runs on Android/iOS).
@@ -25,6 +33,10 @@ Usage:
     python export_all.py --no-copy             # don't copy to desktop app
     python export_all.py --pose                # export a Pose model (4 keypoints)
     python export_all.py --pose --kpt-shape 4 3
+    python export_all.py --obb                 # export an OBB model
+    python export_all.py --obb --run nail_obb_smoke_20260727
+    python export_all.py --seg-2class         # export a Seg 2-class model (nail_bed + full_nail)
+    python export_all.py --seg-2class --run Nail_Detection_ThanhDT_seg_2class_20260729
 """
 from __future__ import annotations
 
@@ -44,15 +56,13 @@ MOBILE_DIR: Path = WORKSPACE_ROOT / "mobile_model"
 
 
 def list_runs() -> List[Path]:
-    """Return sorted list of run directories containing best.pt."""
+    """Return sorted list of run directories containing best.pt (recursive)."""
     if not RUNS_DIR.exists():
         return []
     runs: List[Path] = []
-    for run_dir in RUNS_DIR.iterdir():
-        if not run_dir.is_dir():
-            continue
-        best_pt = run_dir / "weights" / "best.pt"
-        if best_pt.exists():
+    for best_pt in RUNS_DIR.rglob("weights/best.pt"):
+        run_dir = best_pt.parent.parent  # weights/ -> run root
+        if run_dir not in runs:
             runs.append(run_dir)
     return sorted(runs, key=lambda p: p.stat().st_mtime, reverse=True)
 
@@ -82,6 +92,8 @@ def export_onnx(
     out_dir: Path,
     imgsz: int = 416,
     pose: bool = False,
+    obb: bool = False,
+    seg_2class: bool = False,
     kpt_shape: tuple[int, int] = (4, 3),
 ) -> Optional[Path]:
     """Export best.pt to ONNX format. Returns the path to the ONNX file.
@@ -91,7 +103,9 @@ def export_onnx(
         out_dir:    Directory where the ONNX will be saved.
         imgsz:      Input image size.
         pose:       If True, exports as a Pose model (with keypoints).
-        kpt_shape:  (num_keypoints, keypoint_dim) for Pose export.
+        obb:        If True, exports as an OBB model (oriented bounding boxes).
+        seg_2class: If True, exports as a Seg 2-class model (nail_bed + full_nail).
+        kpt_shape:  (num_keypoints, keypoint_dim) for Pose export. Ignored for OBB.
     """
     try:
         from ultralytics import YOLO
@@ -101,7 +115,12 @@ def export_onnx(
         return None
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    task = "Pose" if pose else "Seg"
+    if obb:
+        task = "OBB"
+    elif pose:
+        task = "Pose"
+    else:
+        task = "Seg"
     print(f"\n[ONNX] Exporting {best_pt.name} -> ONNX (task={task}, imgsz={imgsz})...")
     model = YOLO(str(best_pt))
 
@@ -115,13 +134,18 @@ def export_onnx(
                 opset=20,
                 kpt_shape=list(kpt_shape),
             )
-        except TypeError:
-            # Older Ultralytics: kpt_shape auto-detected from the .pt.
+        except (TypeError, SyntaxError):
+            # Ultralytics: kpt_shape auto-detected from the .pt.
             exported_path = model.export(
                 format="onnx", imgsz=imgsz, simplify=False, opset=20
             )
+    elif seg_2class:
+        target_name = out_dir / "nail_seg_2class.onnx"
+        exported_path = model.export(format="onnx", imgsz=imgsz, simplify=False, opset=20)
     else:
-        target_name = out_dir / "nail_seg.onnx"
+        # Default Seg
+        suffix = "_5class" if obb and best_pt.parent.parent.name.endswith("5class") else ""
+        target_name = out_dir / ("nail_obb" + suffix + ".onnx" if obb else "nail_seg.onnx")
         exported_path = model.export(format="onnx", imgsz=imgsz, simplify=False, opset=20)
 
     exported_path = Path(exported_path)
@@ -136,6 +160,8 @@ def export_tflite(
     out_dir: Path,
     imgsz: int = 416,
     pose: bool = False,
+    obb: bool = False,
+    seg_2class: bool = False,
 ) -> Optional[Path]:
     """Export best.pt to LiteRT/TFLite format.
 
@@ -145,11 +171,16 @@ def export_tflite(
     system = platform.system()
 
     if system == "Windows":
-        return _export_tflite_windows(best_pt, out_dir, imgsz=imgsz, pose=pose)
+        return _export_tflite_windows(best_pt, out_dir, imgsz=imgsz, pose=pose, obb=obb, seg_2class=seg_2class)
 
     # Linux / macOS: use Ultralytics native path.
     out_dir.mkdir(parents=True, exist_ok=True)
-    task = "Pose" if pose else "Seg"
+    if obb:
+        task = "OBB"
+    elif pose:
+        task = "Pose"
+    else:
+        task = "Seg"
     print(f"\n[TFLite] Exporting {best_pt.name} -> LiteRT/TFLite FP16 "
           f"(task={task}, imgsz={imgsz})...")
     try:
@@ -157,7 +188,14 @@ def export_tflite(
         model = YOLO(str(best_pt))
         exported_path = model.export(format="litert", imgsz=imgsz, half=True)
         exported_path = Path(exported_path)
-        target = out_dir / ("nail_pose_float16.tflite" if pose else "nail_seg_float16.tflite")
+        if obb:
+            target = out_dir / "nail_obb_float16.tflite"
+        elif pose:
+            target = out_dir / "nail_pose_float16.tflite"
+        elif seg_2class:
+            target = out_dir / "nail_seg_2class_float16.tflite"
+        else:
+            target = out_dir / "nail_seg_float16.tflite"
         if exported_path.resolve() != target.resolve():
             shutil.move(str(exported_path), str(target))
         size_mb = target.stat().st_size / (1024 * 1024)
@@ -173,6 +211,9 @@ def _export_tflite_windows(
     out_dir: Path,
     imgsz: int = 416,
     pose: bool = False,
+    obb: bool = False,
+    seg_2class: bool = False,
+    kpt_shape: tuple[int, int] = (21, 3),
 ) -> Optional[Path]:
     """Windows-only: ONNX -> TFLite via onnx2tf."""
     os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
@@ -185,22 +226,50 @@ def _export_tflite_windows(
         print("  pip install onnx2tf tf_keras onnx-graphsurgeon")
         return None
 
-    task = "Pose" if pose else "Seg"
+    if obb:
+        task = "OBB"
+        target = out_dir / "nail_obb_float16.tflite"
+    elif pose:
+        task = "Pose"
+        target = out_dir / "nail_pose_float16.tflite"
+    elif seg_2class:
+        task = "Seg 2-class"
+        target = out_dir / "nail_seg_2class_float16.tflite"
+    else:
+        task = "Seg"
+        target = out_dir / "nail_seg_float16.tflite"
     print(f"\n[TFLite] Windows pipeline: ONNX (static) -> onnx2tf -> TFLite "
           f"(task={task}, imgsz={imgsz})...")
 
     # --- Step 1: re-export ONNX with static shape ---
-    static_onnx = out_dir / ("nail_pose_static.onnx" if pose else "nail_seg_static.onnx")
+    if obb:
+        static_onnx = out_dir / "nail_obb_static.onnx"
+    elif pose:
+        static_onnx = out_dir / "nail_pose_static.onnx"
+    elif seg_2class:
+        static_onnx = out_dir / "nail_seg_2class_static.onnx"
+    else:
+        static_onnx = out_dir / "nail_seg_static.onnx"
     try:
         from ultralytics import YOLO
         model = YOLO(str(best_pt))
-        export_target = model.export(
-            format="onnx",
-            imgsz=imgsz,
-            simplify=True,
-            opset=20,
-            batch=1,
-        )
+        
+        export_kwargs = {
+            "format": "onnx",
+            "imgsz": imgsz,
+            "simplify": True,
+            "opset": 20,
+            "batch": 1,
+        }
+        if pose:
+            export_kwargs["kpt_shape"] = list(kpt_shape)
+            
+        try:
+            export_target = model.export(**export_kwargs)
+        except (TypeError, SyntaxError):
+            # Fallback for older Ultralytics versions
+            export_kwargs.pop("kpt_shape", None)
+            export_target = model.export(**export_kwargs)
         export_target = Path(export_target)
         if export_target.resolve() != static_onnx.resolve():
             shutil.move(str(export_target), str(static_onnx))
@@ -211,7 +280,12 @@ def _export_tflite_windows(
         return None
 
     # --- Step 2: ONNX -> TFLite via onnx2tf ---
-    target = out_dir / ("nail_pose_float16.tflite" if pose else "nail_seg_float16.tflite")
+    if obb:
+        target = out_dir / "nail_obb_float16.tflite"
+    elif pose:
+        target = out_dir / "nail_pose_float16.tflite"
+    else:
+        target = out_dir / "nail_seg_float16.tflite"
     static_onnx_abs = static_onnx.resolve()
     out_dir_abs = out_dir.resolve()
     try:
@@ -276,7 +350,7 @@ def _export_tflite_windows(
         return None
 
 
-def copy_to_desktop(onnx_path: Path, pose: bool = False) -> Optional[Path]:
+def copy_to_desktop(onnx_path: Path, pose: bool = False, obb: bool = False, seg_2class: bool = False) -> Optional[Path]:
     """Copy the ONNX file to nail_desktop_app/assets/."""
     if not DESKTOP_ASSETS.exists():
         print(f"[Copy] Desktop assets dir not found: {DESKTOP_ASSETS}")
@@ -285,14 +359,21 @@ def copy_to_desktop(onnx_path: Path, pose: bool = False) -> Optional[Path]:
     DESKTOP_ASSETS.mkdir(parents=True, exist_ok=True)
     target = DESKTOP_ASSETS / onnx_path.name
     shutil.copy2(str(onnx_path), str(target))
-    label = "Pose" if pose else "Seg"
+    if obb:
+        label = "OBB"
+    elif pose:
+        label = "Pose"
+    elif seg_2class:
+        label = "Seg 2-class"
+    else:
+        label = "Seg"
     print(f"[Copy] Copied {label} ONNX to: {target}")
     return target
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Unified ONNX + TFLite exporter for nail-seg / nail-pose YOLO models."
+        description="Unified ONNX + TFLite exporter for nail-seg / nail-pose / nail-obb YOLO models."
     )
     parser.add_argument("--run", type=str, default=None,
                         help="Specific run directory name under runs/ (skip interactive pick)")
@@ -304,7 +385,13 @@ def parse_args() -> argparse.Namespace:
                         help="Don't copy ONNX to nail_desktop_app/assets/")
     parser.add_argument("--pose", action="store_true",
                         help="Export a Pose model (expects kpt_shape in data.yaml)")
-    parser.add_argument("--kpt-shape", type=int, nargs=2, default=[4, 3],
+    parser.add_argument("--obb", action="store_true",
+                        help="Export an OBB (oriented bounding box) model")
+    parser.add_argument("--seg", action="store_true",
+                        help="Export a Seg model (default when neither --pose nor --obb is set)")
+    parser.add_argument("--seg-2class", action="store_true",
+                        help="Export a Seg 2-class model (nail_bed + full_nail)")
+    parser.add_argument("--kpt-shape", type=int, nargs=2, default=[21, 3],
                         help="Pose keypoint shape: <num_keypoints> <keypoint_dim>")
     return parser.parse_args()
 
@@ -318,6 +405,8 @@ def main() -> int:
         print("Train a model first: python train.py")
         if args.pose:
             print("Or train a Pose model: python train_pose.py")
+        elif args.obb:
+            print("Or train an OBB model: python train_obb.py")
         return 1
 
     if args.run:
@@ -332,16 +421,32 @@ def main() -> int:
         run_dir = pick_run(runs)
 
     best_pt = run_dir / "weights" / "best.pt"
+    run_name_lower = run_dir.name.lower()
+    if args.obb or "obb" in run_name_lower:
+        args.obb = True
+        mode_label = "OBB"
+    elif args.pose or "pose" in run_name_lower:
+        args.pose = True
+        mode_label = "Pose"
+    elif args.seg_2class or "2class" in run_name_lower:
+        args.seg_2class = True
+        mode_label = "Seg 2-class"
+    else:
+        mode_label = "Seg"
     print(f"\nSelected run: {run_dir.name}")
     print(f"Source model: {best_pt}")
-    print(f"Mode        : {'Pose' if args.pose else 'Seg'}")
+    print(f"Mode        : {mode_label}")
 
     mobile_out = MOBILE_DIR / run_dir.name
     mobile_out.mkdir(parents=True, exist_ok=True)
 
     # --- ONNX ---
     onnx_path = export_onnx(
-        best_pt, mobile_out, imgsz=args.imgsz, pose=args.pose,
+        best_pt, mobile_out,
+        imgsz=args.imgsz,
+        pose=args.pose,
+        obb=args.obb,
+        seg_2class=args.seg_2class,
         kpt_shape=tuple(args.kpt_shape),
     )
     if onnx_path is None:
@@ -350,7 +455,7 @@ def main() -> int:
     # --- TFLite ---
     tflite_path: Optional[Path] = None
     if not args.no_tflite:
-        tflite_path = export_tflite(best_pt, mobile_out, imgsz=args.imgsz, pose=args.pose)
+        tflite_path = export_tflite(best_pt, mobile_out, imgsz=args.imgsz, pose=args.pose, obb=args.obb, seg_2class=args.seg_2class)
         if tflite_path is None:
             sysname = platform.system()
             if sysname == "Windows":
@@ -361,7 +466,7 @@ def main() -> int:
 
     # --- Copy to desktop ---
     if not args.no_copy:
-        copy_to_desktop(onnx_path, pose=args.pose)
+        copy_to_desktop(onnx_path, pose=args.pose, obb=args.obb, seg_2class=args.seg_2class)
         # Also copy TFLite if it was produced.
         if tflite_path and tflite_path.exists():
             tflite_dest = DESKTOP_ASSETS / tflite_path.name
@@ -377,7 +482,7 @@ def main() -> int:
 
     # --- Summary ---
     print("\n" + "=" * 70)
-    print(f"EXPORT SUMMARY  ({'Pose' if args.pose else 'Seg'})")
+    print(f"EXPORT SUMMARY  ({mode_label})")
     print("=" * 70)
     print(f"Run            : {run_dir.name}")
     print(f"ONNX           : {onnx_path}  "

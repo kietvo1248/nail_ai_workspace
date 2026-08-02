@@ -1,14 +1,24 @@
 """
 ================================================================================
-TRAIN.PY - YOLOv11-Seg Training Script for Nail Segmentation
+TRAIN.PY - Interactive Training Menu for YOLOv11 (Seg / OBB / Pose)
 ================================================================================
-Script huấn luyện mô hình YOLOv11-Seg để phân vùng móng tay (nail segmentation).
+Script điều phối huấn luyện nhiều loại mô hình YOLOv11 cho nhận diện móng.
 
 **Tính năng:**
-  - Interactive input: Hỏi vị trí dataset, validate, thực thi training
+  - Interactive menu: chọn Seg / OBB / Pose / 5-class / 2-class / Resume
   - Multi-dataset support: Mỗi dataset có thư mục results riêng với timestamp
   - Tự động tạo train/val split nếu chưa có
   - Lưu kết quả có tổ chức: runs/<dataset_name>/<timestamp>/
+
+**Menu (chạy ``python train.py`` rồi chọn):**
+
+  [1] Train Seg (legacy)        - YOLOv11-Seg, 1-class, segmentation mask
+  [2] Train OBB (smoke test)    - YOLO11-OBB, 139 ảnh (Nail_Detection_ThanhDT)
+  [3] Train OBB (production)    - YOLO11-OBB, 10,501 ảnh (nail-segmentation)
+  [4] Train OBB 5-class         - YOLO11-OBB, classification index/middle/...
+  [5] Train Pose (legacy)       - YOLOv11-Pose, 4 keypoints
+  [6] Resume training           - tiếp tục last.pt
+  [7] Train Seg 5-class        - YOLOv11-Seg, finger classification (Native + Math)
 
 **Sử dụng:**
   python train.py
@@ -568,55 +578,418 @@ def get_training_config(dataset_name):
 
 
 # =============================================================================
+# MENU / DISPATCH
+# =============================================================================
+
+# Smoke test dataset (139 ảnh) - hard-coded default paths to make the menu
+# flow effortless. Both files live in the parent directory of nail_ai_workspace.
+_SMOKE_DATASET_DATA_YAML = "..\\Nail_Detection_ThanhDT.v1i.yolov11\\data.yaml"
+_SMOKE_DATASET_DATA_YAML_2CLASS = "..\\Nail_Detection_ThanhDT.v1i.yolov11\\data_2class.yaml"
+_PRODUCTION_DATASET_DATA_YAML = "..\\nail-segmentation.v1i.yolov11_10501\\data.yaml"
+
+
+def _run_subprocess(script_relpath: str, *extra_args: str) -> int:
+    """Run another script in the same workspace with the same venv.
+
+    Returns the subprocess exit code.
+    """
+    python_exec = get_python_executable()
+    script_path = Path(__file__).parent.resolve() / script_relpath
+    cmd = [str(python_exec), str(script_path), *extra_args]
+    print_info(f"Exec: {' '.join(cmd)}")
+    result = subprocess.run(cmd, cwd=Path(__file__).parent.resolve())
+    return result.returncode
+
+
+def _run_seg_legacy(dataset_path: Path) -> None:
+    """Run the legacy Seg training flow inline.
+
+    Reproduces the original ``train.py`` behavior: validate, patch
+    ``data.yaml`` if it has pose fields, then train ``yolo11n-seg.pt``.
+    """
+    print_header("TRAIN SEG (LEGACY)")
+
+    # Validate
+    validation = validate_dataset(dataset_path)
+    if not validation["valid"]:
+        print_error("Dataset không hợp lệ!")
+        for err in validation["errors"]:
+            print(f"  {Colors.RED}•{Colors.END} {err}")
+        sys.exit(1)
+
+    # Split if needed
+    if not validation["valid_images"]:
+        print_warning("Dataset chưa có validation folder")
+        choice = input(
+            f"{Colors.YELLOW}Chia train/val tự động (80/20)? (y/n): {Colors.END}"
+        ).strip().lower()
+        if choice in ["y", "yes", ""]:
+            try:
+                split_dataset_auto(dataset_path, val_ratio=0.2)
+            except Exception as e:
+                print_error(f"Lỗi khi chia dataset: {e}")
+                sys.exit(1)
+
+    # data.yaml
+    data_yaml_path = dataset_path / "data.yaml"
+    if not data_yaml_path.exists():
+        create_data_yaml(dataset_path, validation["format"])
+    else:
+        print_success(f"data.yaml đã tồn tại: {data_yaml_path}")
+
+    workspace_root = Path(__file__).parent.resolve()
+    data_yaml_path = ensure_seg_data_yaml(data_yaml_path, workspace_root)
+    print_info(f"data.yaml dùng cho training: {data_yaml_path}")
+
+    # Config
+    dataset_name = dataset_path.name.replace(" ", "_").replace(".", "_")
+    config = get_training_config(dataset_name)
+
+    # Summary
+    print_header("TỔNG KẾT CẤU HÌNH (SEG)")
+    print(f"  Dataset:     {dataset_path}")
+    print(f"  data.yaml:   {data_yaml_path}")
+    print(f"  Epochs:      {config['epochs']}")
+    print(f"  Image size:  {config['imgsz']}")
+    print(f"  Batch size:  {config['batch']}")
+    print(f"  Run name:    {config['run_name']}")
+
+    choice = input(f"\n{Colors.YELLOW}Bắt đầu training? (y/n): {Colors.END}").strip().lower()
+    if choice not in ["y", "yes"]:
+        print_info("Đã hủy training")
+        return
+
+    python_exec = get_python_executable()
+    if not ensure_dependencies(python_exec):
+        print_error("Không thể tiếp tục do thiếu dependencies!")
+        sys.exit(1)
+
+    print_header("BẮT ĐẦU TRAINING SEG")
+
+    from ultralytics import YOLO
+
+    runs_dir = workspace_root / "runs"
+    runs_dir.mkdir(exist_ok=True)
+
+    model = YOLO("yolo11n-seg.pt")
+    model.train(
+        data=str(data_yaml_path),
+        epochs=config["epochs"],
+        imgsz=config["imgsz"],
+        batch=config["batch"],
+        project=str(runs_dir),
+        name=config["run_name"],
+        device="0",
+        degrees=15.0,
+        translate=0.1,
+        scale=0.5,
+        shear=5.0,
+        flipud=0.0,
+        fliplr=0.5,
+        patience=20,
+        save=True,
+        save_period=10,
+        verbose=True,
+    )
+
+    run_dir = runs_dir / config["run_name"]
+    best_model = run_dir / "weights" / "best.pt"
+    print_header("TRAINING HOÀN TẤT!")
+    print_success(f"Run directory: {run_dir}")
+    if best_model.exists():
+        print_success(f"Best model:    {best_model}")
+
+
+def _run_pose_legacy() -> None:
+    """Run the legacy Pose training script via subprocess."""
+    print_header("TRAIN POSE (Hand Pose - 21 keypoints)")
+    
+    # 1. Chọn Dataset trước
+    dataset_path = _pick_dataset_path()
+    print_info(f"Sử dụng dataset: {dataset_path}")
+    
+    # 2. Chọn thông số Train sau
+    epochs, imgsz, batch, device = _prompt_train_params(
+        default_epochs=100, default_imgsz=640, default_batch=8
+    )
+    
+    rc = _run_subprocess(
+        "train_pose.py",
+        "--data", str(dataset_path),
+        "--epochs", epochs,
+        "--imgsz", imgsz,
+        "--batch", batch,
+        "--device", device,
+    )
+    if rc != 0:
+        print_error(f"train_pose.py exited with code {rc}")
+
+
+def _pick_dataset_path() -> Path:
+    """Helper to ask the user to pick a dataset path.
+
+    Same logic as before - scans workspace parent for ``train/images`` or
+    ``images`` folders, lets user pick one or type a manual path.
+    """
+    workspace_root = Path(__file__).parent.resolve()
+    parent_root = workspace_root.parent
+
+    potential_datasets = []
+    for item in parent_root.iterdir():
+        if item.is_dir() and (
+            (item / "train" / "images").exists() or (item / "images").exists()
+        ):
+            potential_datasets.append({"name": item.name, "path": str(item)})
+
+    if len(potential_datasets) > 1:
+        print(f"{Colors.YELLOW}Tìm thấy các dataset trong workspace:{Colors.END}\n")
+        for i, ds in enumerate(potential_datasets, 1):
+            print(f"  {Colors.CYAN}{i}.{Colors.END} {ds['name']}")
+            print(f"      {Colors.BLUE}→{Colors.END} {ds['path']}")
+
+        choice = input(
+            f"\n{Colors.CYAN}Chọn dataset (số) hoặc Enter để nhập đường dẫn: {Colors.END}"
+        ).strip()
+        if choice and choice.isdigit():
+            idx = int(choice) - 1
+            if 0 <= idx < len(potential_datasets):
+                return Path(potential_datasets[idx]["path"]).resolve()
+
+    while True:
+        dataset_path = input_path(
+            "Nhập đường dẫn đến dataset (hoặc Enter để quét workspace)"
+        )
+        if not dataset_path and potential_datasets:
+            dataset_path = potential_datasets[0]["path"]
+        if dataset_path and Path(dataset_path).exists():
+            return Path(dataset_path).resolve()
+        print_error(f"Đường dẫn không tồn tại: {dataset_path}")
+
+
+def _resolve_obb_data_yaml(dataset_path: Path) -> Path:
+    """Return the ``data.yaml`` inside the dataset folder.
+
+    For OBB scripts the convention is to point ``--data`` directly at the
+    dataset's ``data.yaml`` (the scripts themselves handle Seg->OBB conversion
+    and auto-split). We fall back to a typed path if the dataset doesn't ship
+    one.
+    """
+    candidate = dataset_path / "data.yaml"
+    if candidate.exists():
+        return candidate
+    typed = input_path("Dataset không có data.yaml. Nhập đường dẫn data.yaml: ")
+    p = Path(typed)
+    if not p.exists():
+        print_error(f"Không tìm thấy: {p}")
+        sys.exit(1)
+    return p
+
+
+def _prompt_train_params(default_epochs: int, default_imgsz: int, default_batch: int) -> tuple:
+    """ chọn epochs, imgsz, batch size, và device.
+
+    Returns:
+        (epochs_str, imgsz_str, batch_str, device_str)
+    """
+    print(f"\n{Colors.YELLOW}--- Cấu hình training ---{Colors.END}")
+
+    # --- Epochs ---
+    epochs_input = input(
+        f"  {Colors.CYAN}Số epochs {Colors.END}"
+        f"{Colors.YELLOW}(Enter = {default_epochs}){Colors.END}: "
+    ).strip()
+    try:
+        epochs = int(epochs_input) if epochs_input else default_epochs
+    except ValueError:
+        print_warning(f"Giá trị không hợp lệ, dùng mặc định: {default_epochs}")
+        epochs = default_epochs
+
+    # --- Image size ---
+    print(f"\n  Chọn image size:")
+    imgsz_options = {
+        "1": (320, "320 (nhanh, mobile)"),
+        "2": (416, "416 (cân bằng)"),
+        "3": (640, "640 (chất lượng cao, mặc định)"),
+    }
+    for k, (v, label) in imgsz_options.items():
+        marker = f"{Colors.YELLOW} ← default{Colors.END}" if v == default_imgsz else ""
+        print(f"    {Colors.CYAN}{k}.{Colors.END} {label}{marker}")
+    imgsz_choice = input(f"  {Colors.CYAN}Chọn (1-3, Enter = default): {Colors.END}").strip()
+    imgsz = imgsz_options.get(imgsz_choice, (default_imgsz, ""))[0]
+
+    # --- Batch size ---
+    print(f"\n  Chọn batch size:")
+    batch_options = {
+        "1": (4, "4 (ít VRAM, ~4 GB)"),
+        "2": (8, "8 (RTX 2060 an toàn)"),
+        "3": (16, "16 (mặc định, cần ~8 GB)"),
+        "4": (32, "32 (nhiều VRAM)"),
+    }
+    for k, (v, label) in batch_options.items():
+        marker = f"{Colors.YELLOW} ← default{Colors.END}" if v == default_batch else ""
+        print(f"    {Colors.CYAN}{k}.{Colors.END} {label}{marker}")
+    batch_choice = input(f"  {Colors.CYAN}Chọn (1-4, Enter = default): {Colors.END}").strip()
+    batch = batch_options.get(batch_choice, (default_batch, ""))[0]
+
+    # --- Device ---
+    print(f"\n  Chọn thiết bị training:")
+    device_str = scan_gpus()
+    if device_str != "cpu":
+        print(f"  {Colors.GREEN}GPU sẵn sàng: device={device_str}{Colors.END}")
+    else:
+        print(f"  {Colors.YELLOW}Sẽ train trên CPU (chậm hơn).{Colors.END}")
+
+    print(f"\n{Colors.GREEN}  ✔ epochs={epochs}  imgsz={imgsz}  batch={batch}  device={device_str}{Colors.END}\n")
+    return str(epochs), str(imgsz), str(batch), device_str
+
+
+def _run_obb_smoke() -> None:
+    """[2] OBB smoke test (139 ảnh)."""
+    print_header("TRAIN OBB - SMOKE TEST (139 ảnh)")
+    print_info(f"Default data.yaml: {_SMOKE_DATASET_DATA_YAML}")
+    override = input_path("Nhập data.yaml khác (Enter = default)")
+    data_yaml = override if override else _SMOKE_DATASET_DATA_YAML
+
+    epochs, imgsz, batch, device = _prompt_train_params(
+        default_epochs=20, default_imgsz=416, default_batch=8
+    )
+    rc = _run_subprocess(
+        "train_obb.py",
+        "--data", data_yaml,
+        "--epochs", epochs,
+        "--imgsz", imgsz,
+        "--batch", batch,
+        "--device", device,
+    )
+    if rc != 0:
+        print_error(f"train_obb.py exited with code {rc}")
+
+
+def _run_obb_production() -> None:
+    """[3] OBB production (10,501 ảnh)."""
+    print_header("TRAIN OBB - PRODUCTION (10,501 ảnh)")
+    print_info(f"Default data.yaml: {_PRODUCTION_DATASET_DATA_YAML}")
+    override = input_path("Nhập data.yaml khác (Enter = default)")
+    data_yaml = override if override else _PRODUCTION_DATASET_DATA_YAML
+
+    epochs, imgsz, batch, device = _prompt_train_params(
+        default_epochs=150, default_imgsz=640, default_batch=8
+    )
+    rc = _run_subprocess(
+        "train_obb.py",
+        "--data", data_yaml,
+        "--epochs", epochs,
+        "--imgsz", imgsz,
+        "--batch", batch,
+        "--device", device,
+    )
+    if rc != 0:
+        print_error(f"train_obb.py exited with code {rc}")
+
+
+def _run_obb_5class() -> None:
+    """[4] OBB 5-class (finger classification)."""
+    print_header("TRAIN OBB 5-CLASS")
+    print_info(f"Default data.yaml: {_PRODUCTION_DATASET_DATA_YAML}")
+    override = input_path("Nhập data.yaml khác (Enter = default)")
+    data_yaml = override if override else _PRODUCTION_DATASET_DATA_YAML
+
+    epochs, imgsz, batch, device = _prompt_train_params(
+        default_epochs=150, default_imgsz=640, default_batch=8
+    )
+    rc = _run_subprocess(
+        "train_obb_5class.py",
+        "--data", data_yaml,
+        "--epochs", epochs,
+        "--imgsz", imgsz,
+        "--batch", batch,
+        "--device", device,
+    )
+    if rc != 0:
+        print_error(f"train_obb_5class.py exited with code {rc}")
+
+
+def _run_seg_5class() -> None:
+    """[7] Seg 5-class (finger classification + math)."""
+    print_header("TRAIN SEG 5-CLASS (Native + Math Extraction)")
+    
+    # Cho phép người dùng chọn thư mục dataset
+    dataset_path = _pick_dataset_path()
+    data_yaml = dataset_path / "data.yaml"
+    if not data_yaml.exists():
+        print_warning(f"Không tìm thấy data.yaml mặc định ở {data_yaml}")
+        override = input_path("Nhập đường dẫn trực tiếp đến file data.yaml")
+        if override:
+            data_yaml = Path(override)
+        else:
+            return
+            
+    print_info(f"Sử dụng dataset: {data_yaml}")
+
+    epochs, imgsz, batch, device = _prompt_train_params(
+        default_epochs=300, default_imgsz=640, default_batch=8
+    )
+    rc = _run_subprocess(
+        "train_seg_5class.py",
+        "--data", str(data_yaml),
+        "--epochs", epochs,
+        "--imgsz", imgsz,
+        "--batch", batch,
+        "--device", device,
+    )
+    if rc != 0:
+        print_error(f"train_seg_5class.py exited with code {rc}")
+
+
+
+
+
+# =============================================================================
 # MAIN EXECUTION
 # =============================================================================
 def main():
-    print_header("YOLOV11-SEG NAIL SEGMENTATION - TRAINING")
-    print(f"{Colors.YELLOW}Script huấn luyện mô hình với interactive prompts{Colors.END}\n")
+    print_header("YOLOV11 NAIL DETECTION - TRAINING MENU")
+    print(
+        f"{Colors.YELLOW}Script điều phối huấn luyện nhiều loại model "
+        f"(Seg / OBB / Pose).{Colors.END}\n"
+    )
 
     workspace_root = Path(__file__).parent.resolve()
     runs_dir = workspace_root / "runs"
 
-    # --- KHÔI PHỤC TRAINING (RESUME) TỰ ĐỘNG ---
+    # --- RESUME (option 6) ---
     if runs_dir.exists():
         recent_lasts = list(runs_dir.glob("*/weights/last.pt"))
         if recent_lasts:
             recent_lasts.sort(key=lambda x: x.stat().st_mtime, reverse=True)
             latest_last_pt = recent_lasts[0]
             print_header("TÌM THẤY CHECKPOINT CHƯA HOÀN THÀNH")
-            print(f"{Colors.YELLOW}Phát hiện quá trình training có thể đã bị gián đoạn (mất điện).{Colors.END}")
-            print(f"  {Colors.YELLOW}Checkpoint gần nhất:{Colors.END}")
+            print(f"{Colors.YELLOW}Phát hiện quá trình training có thể đã bị gián đoạn.{Colors.END}")
             try:
                 ckpt_disp = latest_last_pt.relative_to(workspace_root)
             except ValueError:
                 ckpt_disp = latest_last_pt
             print(f"  {Colors.CYAN}{ckpt_disp}{Colors.END}")
-            
-            choice = input(f"\n{Colors.YELLOW}Bạn có muốn tiếp tục (resume) quá trình train này không? (y/n, Enter để bỏ qua): {Colors.END}").strip().lower()
-            if choice in ['y', 'yes']:
+
+            choice = input(
+                f"\n{Colors.YELLOW}Bạn có muốn resume training này không? "
+                f"(y/n, Enter = bỏ qua): {Colors.END}"
+            ).strip().lower()
+            if choice in ["y", "yes"]:
                 python_exec = get_python_executable()
                 if not ensure_dependencies(python_exec):
                     sys.exit(1)
-                    
+
                 print_header("BẮT ĐẦU PHỤC HỒI TRAINING")
                 try:
                     from ultralytics import YOLO
-                    print_info(f"Đang tải bản lưu trạng thái từ: {latest_last_pt.name}")
+                    print_info(f"Đang tải checkpoint: {latest_last_pt.name}")
                     model = YOLO(str(latest_last_pt))
-                    # resume=True sẽ tự động lấy mọi cấu hình cũ (data.yaml, device, epochs...)
                     model.train(resume=True)
-                    
-                    print_header("TRAINING HOÀN TẤT!")
-                    run_dir = latest_last_pt.parent.parent
-                    best_model = run_dir / "weights" / "best.pt"
-                    print_success("Quá trình huấn luyện phục hồi đã kết thúc.")
-                    print(f"\n{Colors.GREEN}KẾT QUẢ:{Colors.END}")
-                    print(f"  Run directory: {run_dir}")
-                    if best_model.exists():
-                        print(f"  Best model:   {best_model}")
+                    print_header("TRAINING HOÀN TẤT (RESUME)")
                     sys.exit(0)
                 except KeyboardInterrupt:
-                    print("\n")
+                    print()
                     print_warning("Training đã bị dừng bởi user.")
                     sys.exit(0)
                 except Exception as e:
@@ -625,230 +998,54 @@ def main():
                     traceback.print_exc()
                     sys.exit(1)
 
-    # Step 0: Scan GPUs
-    print_header("BƯỚC 0: QUÉT GPU")
-    selected_device = scan_gpus()
+    # --- MAIN MENU ---
+    print_header("CHỌN CHẾ ĐỘ TRAINING")
+    menu_options = [
+        "Train Seg (legacy, 1-class)",          # 1
+        "Train OBB (smoke test) - 139 ảnh",     # 2
+        "Train OBB (production) - 10,501 ảnh",  # 3
+        "Train OBB 5-class (finger names)",     # 4
+        "Train Pose (Hand Pose - 21 keypoints)",# 5
+        "Resume training (đã có last.pt)",       # 6
+        "Train Seg 5-class (Native + Math Extraction)", # 7
+    ]
+    for i, opt in enumerate(menu_options, 1):
+        print(f"  {Colors.CYAN}{i}.{Colors.END} {opt}")
 
-    # Step 1: Get dataset path
-    print_header("BƯỚC 1: CHỌN DATASET")
+    choice = input(
+        f"\n{Colors.CYAN}Chọn (1-7, Enter = 1): {Colors.END}"
+    ).strip() or "1"
 
-    # Try to find existing datasets
-    workspace_root = Path(__file__).parent.resolve()
-    parent_root = workspace_root.parent
+    if choice not in {"1", "2", "3", "4", "5", "6", "7"}:
+        print_warning("Lựa chọn không hợp lệ, mặc định về [1] Seg.")
+        choice = "1"
 
-    # Scan for potential datasets
-    potential_datasets = []
+    # --- DISPATCH ---
+    if choice == "1":
+        print_header("BƯỚC 0: QUÉT GPU")
+        scan_gpus()  # Informational; legacy flow defaults device="0"
+        dataset_path = _pick_dataset_path()
+        _run_seg_legacy(dataset_path)
 
-    # Scan workspace root
-    for item in parent_root.iterdir():
-        if item.is_dir():
-            # Check if it looks like a dataset
-            if (item / "train" / "images").exists() or (item / "images").exists():
-                potential_datasets.append({
-                    "name": item.name,
-                    "path": str(item),
-                    "type": "folder"
-                })
+    elif choice == "2":
+        _run_obb_smoke()
 
-    # Add manual input option
-    potential_datasets.append({
-        "name": "Nhập đường dẫn khác...",
-        "path": "manual",
-        "type": "manual"
-    })
+    elif choice == "3":
+        _run_obb_production()
 
-    if len(potential_datasets) > 1:
-        print(f"{Colors.YELLOW}Tìm thấy các dataset trong workspace:{Colors.END}\n")
-        for i, ds in enumerate(potential_datasets[:-1], 1):
-            print(f"  {Colors.CYAN}{i}.{Colors.END} {ds['name']}")
-            print(f"      {Colors.BLUE}→{Colors.END} {ds['path']}")
+    elif choice == "4":
+        _run_obb_5class()
 
-        choice = input(f"\n{Colors.CYAN}Chọn dataset (số) hoặc Enter để nhập đường dẫn: {Colors.END}").strip()
+    elif choice == "5":
+        _run_pose_legacy()
 
-        if choice and choice.isdigit():
-            idx = int(choice) - 1
-            if 0 <= idx < len(potential_datasets) - 1:
-                dataset_path = potential_datasets[idx]["path"]
-            elif idx == len(potential_datasets) - 1:
-                dataset_path = None
-            else:
-                dataset_path = None
-        else:
-            dataset_path = None
-    else:
-        dataset_path = None
+    elif choice == "6":
+        # Re-trigger the resume block if user picks it from the menu.
+        print_info("Hãy chạy lại script để kích hoạt resume prompt.")
+        print_info("Hoặc đặt last.pt vào runs/<name>/weights/last.pt rồi chạy lại.")
 
-    # Manual input if not selected
-    while not dataset_path or not Path(dataset_path).exists():
-        dataset_path = input_path("Nhập đường dẫn đến dataset (hoặc Enter để quét workspace)")
-
-        if not dataset_path:
-            # Scan workspace
-            if potential_datasets:
-                dataset_path = potential_datasets[0]["path"]
-            else:
-                print_error("Không tìm thấy dataset nào trong workspace!")
-                dataset_path = input_path("Nhập đường dẫn dataset: ")
-
-        if Path(dataset_path).exists():
-            break
-
-        print_error(f"Đường dẫn không tồn tại: {dataset_path}")
-        dataset_path = None
-
-    dataset_path = Path(dataset_path).resolve()
-    print_success(f"Dataset: {dataset_path}")
-
-    # Step 2: Validate dataset
-    print_header("BƯỚC 2: VALIDATE DATASET")
-
-    validation = validate_dataset(dataset_path)
-
-    if not validation["valid"]:
-        print_error("Dataset không hợp lệ!")
-        for err in validation["errors"]:
-            print(f"  {Colors.RED}•{Colors.END} {err}")
-        sys.exit(1)
-
-    print_success(f"Dataset hợp lệ!")
-    print(f"  Format: {validation['format']}")
-    print(f"  Tổng ảnh: {validation['total_images']}")
-
-    if not validation["valid_images"]:
-        print_warning("Dataset chưa có validation folder")
-
-        choice = input(f"\n{Colors.YELLOW}Chia train/val tự động (80/20)? (y/n): {Colors.END}").strip().lower()
-        if choice in ["y", "yes", ""]:
-            try:
-                split_dataset_auto(dataset_path, val_ratio=0.2)
-            except Exception as e:
-                print_error(f"Lỗi khi chia dataset: {e}")
-                sys.exit(1)
-
-    # Step 3: Create data.yaml
-    print_header("BƯỚC 3: TẠO DATA.YAML")
-
-    data_yaml_path = dataset_path / "data.yaml"
-    if not data_yaml_path.exists():
-        create_data_yaml(dataset_path, validation["format"])
-    else:
-        print_success(f"data.yaml đã tồn tại: {data_yaml_path}")
-
-    # If the dataset's data.yaml has Pose/Seg fields (kpt_shape), build a
-    # workspace-local copy with those fields stripped so Ultralytics Detect
-    # training does not crash on a format mismatch. The original dataset file
-    # is never modified.
-    workspace_root = Path(__file__).parent.resolve()
-    data_yaml_path = ensure_seg_data_yaml(data_yaml_path, workspace_root)
-    print_info(f"data.yaml dùng cho training: {data_yaml_path}")
-
-    # Step 4: Get training config
-    dataset_name = dataset_path.name.replace(" ", "_").replace(".", "_")
-    config = get_training_config(dataset_name)
-
-    # Step 5: Summary
-    print_header("TỔNG KẾT CẤU HÌNH")
-    print(f"  Dataset:     {dataset_path}")
-    device_display = f"GPU {selected_device}" if selected_device != "cpu" else "CPU"
-    print(f"  Device:      {device_display}")
-    print(f"  data.yaml:   {data_yaml_path}")
-    print(f"  Epochs:      {config['epochs']}")
-    print(f"  Image size:  {config['imgsz']}")
-    print(f"  Batch size:  {config['batch']}")
-    print(f"  Run name:    {config['run_name']}")
-
-    choice = input(f"\n{Colors.YELLOW}Bắt đầu training? (y/n): {Colors.END}").strip().lower()
-
-    if choice not in ["y", "yes"]:
-        print_info("Đã hủy training")
-        sys.exit(0)
-
-    # Step 6: Get Python executable and check dependencies
-    print_header("BƯỚC 4: KIỂM TRA MÔI TRƯỜNG")
-
-    python_exec = get_python_executable()
-    print_info(f"Python executable: {python_exec}")
-
-    # Check dependencies
-    if not ensure_dependencies(python_exec):
-        print_error("Không thể tiếp tục do thiếu dependencies!")
-        sys.exit(1)
-
-    # Step 7: Execute training
-    print_header("BƯỚC 5: BẮT ĐẦU TRAINING")
-
-    runs_dir = workspace_root / "runs"
-    runs_dir.mkdir(exist_ok=True)
-
-    print_info("Bắt đầu training... (Ctrl+C để dừng)")
-    print("-" * 60)
-
-    try:
-        # Import YOLO and run training directly
-        from ultralytics import YOLO
-        import torch
-
-        device = selected_device
-        print_info(f"Training device: {'GPU ' + device + ' (' + torch.cuda.get_device_name(int(device)) + ')' if device != 'cpu' else 'CPU'}")
-
-        model = YOLO("yolo11n-seg.pt")
-
-        results = model.train(
-            data=str(data_yaml_path),
-            epochs=config['epochs'],
-            imgsz=config['imgsz'],
-            batch=config['batch'],
-            project=str(runs_dir),
-            name=config['run_name'],
-            device=device,
-            degrees=15.0,
-            translate=0.1,
-            scale=0.5,
-            shear=5.0,
-            flipud=0.0,
-            fliplr=0.5,
-            patience=20,
-            save=True,
-            save_period=10,
-            verbose=True,
-        )
-
-        print_header("TRAINING HOÀN TẤT!")
-
-        # Find output
-        run_dir = runs_dir / config["run_name"]
-        best_model = run_dir / "weights" / "best.pt"
-        last_model = run_dir / "weights" / "last.pt"
-
-        print_success("Training đã hoàn tất!")
-        print()
-        print(f"{Colors.GREEN}KẾT QUẢ:{Colors.END}")
-        print(f"  Run directory: {run_dir}")
-
-        if best_model.exists():
-            print(f"  Best model:   {best_model}")
-            print(f"  File size:    {best_model.stat().st_size / (1024*1024):.2f} MB")
-
-        # Show results location
-        print()
-        print_success(f"Đường dẫn kết quả: {run_dir}")
-        print()
-        print(f"{Colors.CYAN}Các file quan trọng:{Colors.END}")
-        for item in run_dir.glob("**/*"):
-            if item.is_file() and item.suffix in [".pt", ".png", ".jpg"]:
-                rel_path = item.relative_to(run_dir)
-                print(f"  - {rel_path}")
-
-    except KeyboardInterrupt:
-        print()
-        print_warning("Training đã bị dừng bởi user")
-        sys.exit(0)
-
-    except Exception as e:
-        print_error(f"Lỗi khi chạy training: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+    elif choice == "7":
+        _run_seg_5class()
 
 
 if __name__ == "__main__":
