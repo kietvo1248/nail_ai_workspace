@@ -214,23 +214,23 @@ def main() -> int:
         plots=True,
         verbose=True,
         amp=False,             # Disable AMP to prevent CUDA misaligned address error
-        # Augmentation parameters identical to OBB for maximum robustness
-        # degrees=args.degrees,
+        # Optimized augmentations for crisp Segmentation masks
         degrees=180.0,
-        translate=0.2,
-        scale=0.9,
-        shear=10.0,
-        perspective=0.001,
-        fliplr=0.0,            # hard-locked off for 5-class to keep thumb vs pinky distinct
+        translate=0.1,
+        scale=0.3,             # Reduced to preserve nail texture
+        shear=0.0,             # Disabled to prevent mask distortion
+        perspective=0.0,       # Disabled to prevent polygon warping
+        fliplr=0.0,            # Hard-locked off for 5-class to keep thumb vs pinky distinct
         flipud=0.0,
         mosaic=1.0,
-        mixup=0.15,
-        copy_paste=0.3,
+        mixup=0.0,             # Disabled to avoid mask ghosting
+        copy_paste=0.0,        # Disabled to avoid overlap
         hsv_h=0.02,
-        hsv_s=0.8,
-        hsv_v=0.5,
-        erasing=0.4,
-        cls=2.0,               # heavily penalize wrong finger class
+        hsv_s=0.3,             # Reduced to preserve surface color
+        hsv_v=0.2,             # Reduced to preserve surface brightness
+        erasing=0.0,           # Disabled to prevent destroying the nail surface
+        cls=2.0,               # Heavily penalize wrong finger class
+        overlap_mask=False,    # Force learning distinct boundaries for each nail
     )
 
     print("\nTraining complete.")
