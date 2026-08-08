@@ -19,6 +19,9 @@ Script điều phối huấn luyện nhiều loại mô hình YOLOv11 cho nhận
   [5] Train Pose (legacy)       - YOLOv11-Pose, 4 keypoints
   [6] Resume training           - tiếp tục last.pt
   [7] Train Seg 5-class        - YOLOv11-Seg, finger classification (Native + Math)
+  [8] Train Seg 5-class V3+    - nail-vs-skin boundary (mosaic 0.5,
+                                  close_mosaic 15, overlap_mask, negative
+                                  frames) - V3+ tuning (2026-08-08)
 
 **Sử dụng:**
   python train.py
@@ -587,6 +590,11 @@ _SMOKE_DATASET_DATA_YAML = "..\\Nail_Detection_ThanhDT.v1i.yolov11\\data.yaml"
 _SMOKE_DATASET_DATA_YAML_2CLASS = "..\\Nail_Detection_ThanhDT.v1i.yolov11\\data_2class.yaml"
 _PRODUCTION_DATASET_DATA_YAML = "..\\nail-segmentation.v1i.yolov11_10501\\data.yaml"
 
+# V3 dataset (3,107 ảnh + 6 negative) + thư mục background frames cho [8].
+# Đường dẫn này tương đối so với nail_ai_workspace/ - vì user thường `cd` vào đây trước khi chạy.
+_V3_DATASET_DATA_YAML = "..\\nail-segmentation.v3-demo-train.yolov11\\data.yaml"
+_V3_BACKGROUND_FRAMES_DIR = "..\\background_frames"
+
 
 def _run_subprocess(script_relpath: str, *extra_args: str) -> int:
     """Run another script in the same workspace with the same venv.
@@ -941,6 +949,205 @@ def _run_seg_5class() -> None:
         print_error(f"train_seg_5class.py exited with code {rc}")
 
 
+def _prompt_yes_no(prompt_text: str, default_yes: bool = True) -> bool:
+    """Yes/no prompt. Returns True on yes, False on no.
+
+    Args:
+        prompt_text: Câu hỏi.
+        default_yes: Nếu user nhấn Enter, trả về True. Nếu False, mặc định No.
+    """
+    suffix = "(Y/n)" if default_yes else "(y/N)"
+    while True:
+        choice = input(f"{Colors.CYAN}{prompt_text} {suffix}: {Colors.END}").strip().lower()
+        if choice == "":
+            return default_yes
+        if choice in ("y", "yes"):
+            return True
+        if choice in ("n", "no"):
+            return False
+        print_warning("Vui lòng nhập y hoặc n.")
+
+
+def _resolve_v3plus_dataset() -> Path:
+    """Hỏi user chọn dataset cho [8]. Mặc định = V3 (3,107 + 6 neg).
+
+    Returns:
+        Path to data.yaml.
+    """
+    default_path = Path(_V3_DATASET_DATA_YAML)
+    print_info(f"Dataset mặc định cho [8]: {default_path}")
+
+    if default_path.exists():
+        print_success(f"Tìm thấy V3 data.yaml: {default_path}")
+        use_default = _prompt_yes_no(
+            "Dùng V3 dataset mặc định?", default_yes=True
+        )
+        if use_default:
+            return default_path.resolve()
+
+    # Fallback: cho user nhập tay (giống [7])
+    dataset_path = _pick_dataset_path()
+    data_yaml = dataset_path / "data.yaml"
+    if not data_yaml.exists():
+        print_warning(f"Không tìm thấy data.yaml ở {data_yaml}")
+        override = input_path("Nhập đường dẫn trực tiếp đến file data.yaml")
+        if override:
+            return Path(override).resolve()
+        print_error("Không có data.yaml - hủy.")
+        sys.exit(1)
+    return data_yaml.resolve()
+
+
+def _resolve_v3plus_background_dir() -> Path | None:
+    """Hỏi user chọn thư mục background frames cho [8].
+
+    Returns:
+        Path tới thư mục chứa negative frames, hoặc None nếu user chọn
+        không inject (cũng OK - dataset đã có sẵn 6 neg trong V3).
+    """
+    default_path = Path(_V3_BACKGROUND_FRAMES_DIR)
+
+    print()
+    print(f"{Colors.YELLOW}Background / negative frames:{Colors.END}")
+    print("  - Ảnh tay không có móng, da bệnh, nền xa...")
+    print("  - Script sẽ copy vào train/ + tạo label rỗng (idempotent)")
+    print(f"  - Default path: {default_path}")
+
+    if default_path.exists() and default_path.is_dir():
+        n_files = sum(
+            1 for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp")
+            for _ in default_path.glob(ext)
+        )
+        print_success(f"Tìm thấy {n_files} ảnh trong {default_path}")
+        use_default = _prompt_yes_no(
+            "Dùng thư mục background mặc định?", default_yes=True
+        )
+        if use_default:
+            return default_path.resolve()
+    else:
+        print_warning(f"Thư mục mặc định không tồn tại: {default_path}")
+        print_info("Có thể bỏ qua nếu dataset đã inject sẵn negative.")
+
+    skip = _prompt_yes_no(
+        "Bỏ qua inject background?", default_yes=True
+    )
+    if skip:
+        return None
+
+    # User muốn inject nhưng không có sẵn -> cho nhập path khác
+    typed = input_path("Nhập đường dẫn thư mục background frames")
+    if typed and Path(typed).is_dir():
+        return Path(typed).resolve()
+
+    print_warning("Đường dẫn không hợp lệ - sẽ bỏ qua inject.")
+    return None
+
+
+def _run_seg_5class_v3plus() -> None:
+    """[8] Seg 5-class V3+ (nail-vs-skin boundary).
+
+    Khác với [7] ở chỗ:
+      - Dataset mặc định là V3 (3,107 ảnh + 6 negative đã inject).
+      - Hỏi user có muốn inject thêm background frames không.
+      - Epochs mặc định 60 (nhanh, đủ cho nail-vs-skin task với V3 augmentation).
+      - Patience mặc định 15 (early-stop sớm để tiết kiệm thời gian).
+      - Có warning nếu user quên inject mà dataset không có negative nào.
+
+    Forward sang train_seg_5class.py với các flag tương ứng. Script
+    train_seg_5class.py đã có sẵn logic:
+      - mosaic=0.5
+      - close_mosaic=15
+      - overlap_mask=True
+      - copy_paste=0, mixup=0, shear=0, perspective=0, fliplr=0 (giữ nguyên)
+    """
+    print_header("TRAIN SEG 5-CLASS V3+ (NAIL-VS-SKIN BOUNDARY)")
+    print(f"{Colors.CYAN}V3+ tuning (2026-08-08):{Colors.END}")
+    print("  - mosaic=0.5     : giảm mosaic để model thấy full hand")
+    print("  - close_mosaic=15: 15 epoch cuối tắt mosaic, học boundary sắc nét")
+    print("  - overlap_mask=True: cho phép 2 nail chồng nhau, không merge")
+    print("  - 6 negative frames: dạy model 'có ảnh không có móng'")
+    print()
+
+    # 1) Chọn dataset
+    data_yaml = _resolve_v3plus_dataset()
+    print_success(f"data.yaml: {data_yaml}")
+
+    # 2) Chọn background frames
+    neg_dir = _resolve_v3plus_background_dir()
+    if neg_dir is None:
+        # Kiểm tra xem dataset đã có negative chưa - nếu chưa thì cảnh báo
+        train_labels_dir = data_yaml.parent / "train" / "labels"
+        neg_count = 0
+        if train_labels_dir.exists():
+            neg_count = sum(
+                1 for f in train_labels_dir.glob("*.txt") if f.stat().st_size == 0
+            )
+        if neg_count == 0:
+            print_warning(
+                "Dataset KHÔNG có negative frames và bạn đã bỏ qua inject."
+            )
+            print_warning(
+                "Model có thể không học được nail-vs-skin boundary tốt."
+            )
+            proceed = _prompt_yes_no(
+                "Vẫn tiếp tục training?", default_yes=False
+            )
+            if not proceed:
+                print_info("Đã hủy training.")
+                return
+        else:
+            print_success(f"Dataset đã có {neg_count} negative frame(s) sẵn.")
+    else:
+        print_success(f"Background frames: {neg_dir}")
+
+    # 3) Chọn epochs/imgsz/batch/device - default phù hợp V3+ nail-vs-skin
+    epochs, imgsz, batch, device = _prompt_train_params(
+        default_epochs=60, default_imgsz=640, default_batch=16
+    )
+
+    # 4) Hỏi patience riêng (V3+ cần nhỏ để early-stop sớm)
+    print(f"\n{Colors.YELLOW}Patience (early-stop):{Colors.END}")
+    print(f"  {Colors.CYAN}1.{Colors.END} 10 (rất nhanh)")
+    print(f"  {Colors.CYAN}2.{Colors.END} 15 (mặc định V3+, khuyến nghị)")
+    print(f"  {Colors.CYAN}3.{Colors.END} 20 (kiên nhẫn)")
+    pat_choice = input(f"\n{Colors.CYAN}Chọn (1-3, Enter = 15): {Colors.END}").strip()
+    pat_map = {"1": "10", "2": "15", "3": "20"}
+    patience = pat_map.get(pat_choice, "15")
+
+    # 5) Tổng kết
+    print_header("TỔNG KẾT CẤU HÌNH V3+")
+    print(f"  Dataset:           {data_yaml}")
+    print(f"  Background frames: {neg_dir or '(bỏ qua - dùng negative có sẵn)'}")
+    print(f"  Epochs:            {epochs}")
+    print(f"  Image size:        {imgsz}")
+    print(f"  Batch size:        {batch}")
+    print(f"  Device:            {device}")
+    print(f"  Patience:          {patience}")
+    print(f"  mosaic=0.5, close_mosaic=15, overlap_mask=True (mặc định trong script)")
+
+    proceed = _prompt_yes_no("Bắt đầu training?", default_yes=True)
+    if not proceed:
+        print_info("Đã hủy training.")
+        return
+
+    # 6) Build command
+    cmd_args = [
+        "train_seg_5class.py",
+        "--data", str(data_yaml),
+        "--epochs", epochs,
+        "--imgsz", imgsz,
+        "--batch", batch,
+        "--device", device,
+        "--patience", patience,
+    ]
+    if neg_dir is not None:
+        cmd_args.extend(["--neg-frames-dir", str(neg_dir)])
+
+    rc = _run_subprocess(*cmd_args)
+    if rc != 0:
+        print_error(f"train_seg_5class.py exited with code {rc}")
+
+
 
 
 
@@ -1008,15 +1215,16 @@ def main():
         "Train Pose (Hand Pose - 21 keypoints)",# 5
         "Resume training (đã có last.pt)",       # 6
         "Train Seg 5-class (Native + Math Extraction)", # 7
+        "Train Seg 5-class V3+ (nail-vs-skin, default V3 + neg)", # 8
     ]
     for i, opt in enumerate(menu_options, 1):
         print(f"  {Colors.CYAN}{i}.{Colors.END} {opt}")
 
     choice = input(
-        f"\n{Colors.CYAN}Chọn (1-7, Enter = 1): {Colors.END}"
+        f"\n{Colors.CYAN}Chọn (1-8, Enter = 1): {Colors.END}"
     ).strip() or "1"
 
-    if choice not in {"1", "2", "3", "4", "5", "6", "7"}:
+    if choice not in {"1", "2", "3", "4", "5", "6", "7", "8"}:
         print_warning("Lựa chọn không hợp lệ, mặc định về [1] Seg.")
         choice = "1"
 
@@ -1046,6 +1254,9 @@ def main():
 
     elif choice == "7":
         _run_seg_5class()
+
+    elif choice == "8":
+        _run_seg_5class_v3plus()
 
 
 if __name__ == "__main__":

@@ -19,9 +19,26 @@ Augmentation choices are tuned for the 5-finger problem:
     - ``copy_paste=0.3``    - increase data variance by copying nails.
     - ``cls=2.0``           - heavier loss weight on classification.
 
+V3+ tuning (added 2026-08-08) for nail-vs-skin boundary:
+    - ``mosaic=0.5``        - reduced from 1.0 so model sees full hand context
+                              more often (avoids hallucinating nails from
+                              cropped mosaic tiles).
+    - ``close_mosaic=15``   - last 15 epochs turn mosaic OFF → forces model
+                              to learn crisp nail-edge vs skin boundary on
+                              full-resolution images.
+    - ``overlap_mask=True`` - when two nails touch, allow masks to overlap
+                              during training so model learns to keep them
+                              distinct (instead of merging into one blob).
+    - ``--neg-frames-dir``  - optional path to a folder of background/negative
+                              frames (hands without nails, skin-only images,
+                              etc.) that get auto-copied into train/images
+                              with empty labels. Teaches the model that
+                              ``skin ≠ nail`` and removes false positives.
+
 Usage:
-    python train_seg_5class.py --data ../Nail_Detection_ThanhDT.v1i.yolov11/data.yaml
+    python train_seg_5class.py --data ../nail-segmentation.v3-demo-train.yolov11/data.yaml
     python train_seg_5class.py --data ../Nail_Detection_ThanhDT.v1i.yolov11/data.yaml --epochs 50
+    python train_seg_5class.py --data ../data.yaml --neg-frames-dir ../background_frames --epochs 100
 """
 from __future__ import annotations
 
@@ -143,7 +160,67 @@ def parse_args() -> argparse.Namespace:
                         help="Rotation augmentation in degrees (default: 180).")
     parser.add_argument("--no-strict-5class", action="store_true",
                         help="Allow datasets with class count != 5.")
+    parser.add_argument("--neg-frames-dir", type=str, default=None,
+                        help="Optional folder of negative frames (hands without "
+                             "nails, skin-only, etc.). These will be auto-copied "
+                             "into <data>/train/images with empty .txt labels so "
+                             "the model learns 'skin ≠ nail'. Default: None.")
+    parser.add_argument("--neg-prefix", type=str, default="neg_",
+                        help="Filename prefix used when copying negative frames "
+                             "into the dataset (default: 'neg_').")
     return parser.parse_args()
+
+
+def inject_negative_frames(
+    data_yaml: Path,
+    neg_dir: str | None,
+    prefix: str = "neg_",
+) -> int:
+    """Copy negative frames into ``<dataset>/train/images`` with empty labels.
+
+    Why: the V3 dataset has zero empty labels → model assumes every image
+    contains a nail → it produces false positives on skin-only images.
+    Adding a handful of negative frames (skin, hands without visible nails,
+    defect photos, etc.) teaches the model to output *no* mask when there
+    is no nail.
+
+    Returns the number of negative frames injected.
+    """
+    if not neg_dir:
+        return 0
+    neg_path = Path(neg_dir).expanduser().resolve()
+    if not neg_path.is_dir():
+        print(f"[NEG] WARNING: --neg-frames-dir not found: {neg_path}")
+        return 0
+
+    train_images = data_yaml.parent / "train" / "images"
+    train_labels = data_yaml.parent / "train" / "labels"
+    train_images.mkdir(parents=True, exist_ok=True)
+    train_labels.mkdir(parents=True, exist_ok=True)
+
+    import shutil
+    img_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+    injected = 0
+    for src in sorted(neg_path.iterdir()):
+        if src.suffix.lower() not in img_exts:
+            continue
+        dst_name = f"{prefix}{src.name}"
+        # Avoid double-prefix if file already starts with prefix
+        if src.stem.startswith(prefix):
+            dst_name = src.name
+        dst_img = train_images / dst_name
+        dst_lbl = train_labels / (Path(dst_name).stem + ".txt")
+        if dst_img.exists():
+            # Idempotent: do not overwrite existing data
+            continue
+        shutil.copy2(src, dst_img)
+        # Empty label file = negative sample
+        dst_lbl.write_text("", encoding="utf-8")
+        injected += 1
+    print(f"[NEG] Injected {injected} negative frame(s) from {neg_path}")
+    print(f"[NEG] -> images: {train_images}")
+    print(f"[NEG] -> empty labels written to: {train_labels}")
+    return injected
 
 
 def main() -> int:
@@ -178,6 +255,17 @@ def main() -> int:
             print("      Use --no-strict-5class to silence this warning.")
     except Exception as e:
         print(f"WARN: could not verify class count: {e}")
+
+    # Inject negative frames BEFORE training so the data.yaml scan picks them up.
+    if args.neg_frames_dir:
+        injected = inject_negative_frames(
+            data_yaml=data_yaml,
+            neg_dir=args.neg_frames_dir,
+            prefix=args.neg_prefix,
+        )
+        if injected == 0:
+            print("[NEG] No new negative frames were injected (folder empty or "
+                  "all files already present).")
 
     name = args.name
     if not name:
@@ -222,7 +310,11 @@ def main() -> int:
         perspective=0.0,       # Disabled to prevent polygon warping
         fliplr=0.0,            # Hard-locked off for 5-class to keep thumb vs pinky distinct
         flipud=0.0,
-        mosaic=1.0,
+        mosaic=0.5,            # V3+: reduced from 1.0 — fewer stitched tiles,
+                               # model sees full hand context more often and
+                               # hallucinates fewer nails on cropped mosaic pieces
+        close_mosaic=15,       # V3+: last 15 epochs turn mosaic OFF — forces
+                               # crisp nail-edge vs skin boundary learning
         mixup=0.0,             # Disabled to avoid mask ghosting
         copy_paste=0.0,        # Disabled to avoid overlap
         hsv_h=0.02,
@@ -230,7 +322,9 @@ def main() -> int:
         hsv_v=0.2,             # Reduced to preserve surface brightness
         erasing=0.0,           # Disabled to prevent destroying the nail surface
         cls=2.0,               # Heavily penalize wrong finger class
-        overlap_mask=False,    # Force learning distinct boundaries for each nail
+        overlap_mask=True,     # V3+: was False — now allow mask overlap so
+                               # adjacent nails learn distinct boundaries
+                               # instead of merging into one blob
     )
 
     print("\nTraining complete.")
